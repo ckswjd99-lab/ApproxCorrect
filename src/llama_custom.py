@@ -31,10 +31,174 @@ from transformers.models.llama.modeling_llama import (
 )
 
 from typing import Optional, Union, Callable
-import inspect, warnings, os
+import inspect, warnings, os, math
 from functools import partial
 
 logger = logging.get_logger(__name__)
+
+def scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float = None,
+    enable_gqa: bool = False
+) -> torch.Tensor:
+    """
+    Computes scaled dot product attention with a manual, numerically stable softmax.
+    """
+    # Handle Grouped-Query Attention by repeating K and V heads
+    if enable_gqa:
+        key = key.repeat_interleave(query.size(-3) // key.size(-3), dim=-3)
+        value = value.repeat_interleave(query.size(-3) // value.size(-3), dim=-3)
+
+    L, S = query.size(-2), key.size(-2)
+    
+    # Compute scaled attention scores
+    scale_factor = 1.0 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_scores = torch.matmul(query, key.transpose(-2, -1)) * scale_factor
+
+    # Apply attention mask
+    if is_causal:
+        assert attn_mask is None, "Cannot specify both is_causal and attn_mask"
+        causal_mask = torch.triu(torch.ones(L, S, dtype=torch.bool, device=query.device), diagonal=1)
+        attn_scores.masked_fill_(causal_mask, float("-inf"))
+    elif attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_scores.masked_fill_(~attn_mask, float("-inf"))
+        else:
+            attn_scores += attn_mask
+
+    # Compute attention weights with manual stable softmax
+    attn_dtype = attn_scores.dtype
+    upcasted_attn_scores = attn_scores.to(torch.float32)
+
+    max_scores = torch.max(upcasted_attn_scores, dim=-1, keepdim=True).values
+    shifted_scores = upcasted_attn_scores - max_scores
+    
+    attn_weights_exp = torch.exp(shifted_scores)
+    attn_weights_sum = torch.sum(attn_weights_exp, dim=-1, keepdim=True)
+
+    attn_weights = attn_weights_exp / (attn_weights_sum + 1e-9)
+    attn_weights = attn_weights.to(attn_dtype) # Cast back to original dtype
+
+    # Apply dropout
+    if dropout_p > 0.0:
+        attn_weights = F.dropout(attn_weights, p=dropout_p, training=True)
+
+    # Final output
+    output = torch.matmul(attn_weights, value)
+    return output
+
+attn_prate_list = []
+attn_error_list = []
+def scaled_dot_product_attention_pp(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float = None,
+    enable_gqa: bool = False
+) -> torch.Tensor:
+    """
+    Computes scaled dot product attention with a manual, numerically stable softmax.
+    """
+    # print(query.shape, key.shape, value.shape)    # [B, num_heads, seq_len, head_dim]
+    
+    # Quantize QKV to int8
+    q_abs_max = query.abs().max(dim=-1).values[:, :, :, None]
+    k_abs_max = key.abs().max(dim=-1).values[:, :, :, None]
+    v_abs_max = value.abs().max(dim=-1).values[:, :, :, None]
+
+    query_norm = query / q_abs_max * 127
+    key_norm = key / k_abs_max * 127
+    value_norm = value / v_abs_max * 127
+    
+    query_int8 = query_norm.round().to(torch.int8)
+    key_int8 = key_norm.round().to(torch.int8)
+    value_int8 = value_norm.round().to(torch.int8)
+
+    query_quant = query_int8.to(torch.float16) / 127 * q_abs_max
+    key_quant = key_int8.to(torch.float16) / 127 * k_abs_max
+    value_quant = value_int8.to(torch.float16) / 127 * v_abs_max
+
+    q_diff = query - query_quant
+    k_diff = key - key_quant
+    v_diff = value - value_quant
+
+    query, key, value = query_quant, key_quant, value_quant
+
+    # Handle Grouped-Query Attention by repeating K and V heads
+    if enable_gqa:
+        key = key.repeat_interleave(query.size(-3) // key.size(-3), dim=-3)
+        value = value.repeat_interleave(query.size(-3) // value.size(-3), dim=-3)
+
+        k_diff = k_diff.repeat_interleave(query.size(-3) // k_diff.size(-3), dim=-3)
+        v_diff = v_diff.repeat_interleave(query.size(-3) // v_diff.size(-3), dim=-3)
+
+    L, S = query.size(-2), key.size(-2)
+    
+    # Compute scaled attention scores
+    scale_factor = 1.0 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_scores = torch.matmul(query, key.transpose(-2, -1)) * scale_factor
+
+    # Apply attention mask
+    if is_causal:
+        assert attn_mask is None, "Cannot specify both is_causal and attn_mask"
+        causal_mask = torch.triu(torch.ones(L, S, dtype=torch.bool, device=query.device), diagonal=1)
+        attn_scores.masked_fill_(causal_mask, float("-inf"))
+    elif attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_scores.masked_fill_(~attn_mask, float("-inf"))
+        else:
+            attn_scores += attn_mask
+
+    # Compute attention weights with manual stable softmax
+    attn_dtype = attn_scores.dtype
+    upcasted_attn_scores = attn_scores.to(torch.float32)
+
+    max_scores = torch.max(upcasted_attn_scores, dim=-1, keepdim=True).values
+    shifted_scores = upcasted_attn_scores - max_scores
+    
+    attn_weights_exp = torch.exp(shifted_scores)
+    attn_weights_sum = torch.sum(attn_weights_exp, dim=-1, keepdim=True)
+
+    attn_weights = attn_weights_exp / (attn_weights_sum + 1e-9)
+    attn_weights = attn_weights.to(attn_dtype) # Cast back to original dtype
+
+    # Apply dropout
+    if dropout_p > 0.0:
+        attn_weights = F.dropout(attn_weights, p=dropout_p, training=True)
+
+    # Generate pruning mask
+    threshold = 1e-2
+    prune_mask = attn_weights.abs() < threshold
+
+    # Output from quantized attention
+    output = torch.matmul(attn_weights, value)
+
+    # Difference correction
+    attn_weights = torch.where(prune_mask, torch.zeros_like(attn_weights), attn_weights)
+    attn_prate_list.append(prune_mask.float().mean().item())
+
+    attn_error = attn_weights_exp / (attn_weights_sum + 1e-9) - attn_weights
+    attn_error_list.append(attn_error.abs().mean().item() / (attn_weights_exp / (attn_weights_sum + 1e-9)).abs().mean().item())
+
+    term1_scores_diff = (q_diff @ key.transpose(-2, -1) + query @ k_diff.transpose(-2, -1)) * scale_factor
+    sum_dS_P = torch.sum(term1_scores_diff * attn_weights, dim=-1, keepdim=True)
+    dP = attn_weights * (term1_scores_diff - sum_dS_P)
+    term1 = torch.matmul(dP, value)
+
+    term2 = torch.matmul(attn_weights, v_diff)
+
+    output += term1
+    output += term2
+
+    return output
 
 def sdpa_attention_forward(
     module: torch.nn.Module,
@@ -63,28 +227,18 @@ def sdpa_attention_forward(
     if attention_mask is not None and attention_mask.ndim == 4:
         attention_mask = attention_mask[:, :, :, : key.shape[-2]]
 
-    # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
-    # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
-    # Note that it is important to check first for the shape, otherwise compile will fail with `argument 'is_causal' must be bool, not SymBool`
     if is_causal is None:
-        # The last condition is for encoder (decoder) models which specify this by passing their own `is_causal` flag
-        # This is mainly due to those models having mixed implementations for encoder, decoder, and encoder-decoder attns
         is_causal = query.shape[2] > 1 and attention_mask is None and getattr(module, "is_causal", True)
 
-    # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
-    # We convert it to a bool for the SDPA kernel that only accepts bools.
     if torch.jit.is_tracing() and isinstance(is_causal, torch.Tensor):
         is_causal = is_causal.item()
 
-    # When `is_causal = False` and the `attention_mask` is not of boolean type, the Ascend NPU's SDPA interface cannot utilize the FlashAttentionScore operator，
-    # and falls back to small-operator concatenation. To invoke the FlashAttentionScore, the attention_mask must be converted to boolean type.
-    # This adaptation ensures the `attention_mask` meets the requirement for using FlashAttentionScore.
     if is_torch_npu_available():
         if attention_mask is not None and attention_mask.dtype != torch.bool:
-            # Convert to boolean type, making sdpa to force call FlashAttentionScore to improve performance.
             attention_mask = torch.logical_not(attention_mask.bool()).to(query.device)
 
-    attn_output = torch.nn.functional.scaled_dot_product_attention(
+    # attn_output = scaled_dot_product_attention(
+    attn_output = scaled_dot_product_attention_pp(
         query,
         key,
         value,
@@ -152,6 +306,7 @@ def llama_decoder_ffn_forward(dec_ffn, x):
 
     return down_proj
 
+pratex_list = []
 prate1_list = []
 prate2_list = []
 prate3_list = []
@@ -165,6 +320,11 @@ def llama_decoder_ffn_forward_pp(dec_ffn, x):
 
     # Calculate quantization error
     diff_x = x - x_quant
+
+    thres_x = 1e-3
+    prune_mask_x = diff_x.abs() < thres_x
+    diff_x = torch.where(prune_mask_x, torch.zeros_like(diff_x), diff_x)
+    pratex_list.append(prune_mask_x.float().mean().item())
 
     # Main path with low-precision (quantized) input
     gate_proj = dec_ffn.gate_proj(x_quant)
@@ -186,11 +346,11 @@ def llama_decoder_ffn_forward_pp(dec_ffn, x):
     silu_derivative = sigmoid_gate_proj * (1 + gate_proj * (1 - sigmoid_gate_proj))
     
     # Mask to Prune
-    threshold_1 = 1.1e-1
+    threshold_1 = 1e-1
     prune_mask_1 = (silu_derivative * up_proj).abs() < threshold_1
     prate1_list.append(prune_mask_1.float().mean().item())
 
-    threshold_2 = 2.1e-1
+    threshold_2 = 2e-1
     prune_mask_2 = activated.abs() < threshold_2
     prate2_list.append(prune_mask_2.float().mean().item())
 
@@ -771,6 +931,7 @@ def llama_generate(
         result.past_key_values = result.past_key_values.to_legacy_cache()
     return result
 
+@torch.no_grad()
 def main():
     """Main function to run the comparison."""
     model_id = "meta-llama/Llama-3.2-1B"
@@ -780,6 +941,8 @@ def main():
         dtype=torch.float16,
         device_map="auto"
     )
+    model.eval()
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -838,20 +1001,30 @@ def main():
         print(f"Number of identical initial tokens: {same_count} out of {min_len}")
     
     # print average prune rate
-    if prate1_list and prate2_list and prate3_list:
+    
+    if attn_prate_list:
+        avg_attn_prate = sum(attn_prate_list) / len(attn_prate_list)
+        print(f"Attn Average Prune Rate: {avg_attn_prate*100:.2f}%")
+
+    if attn_error_list:
+        avg_attn_error = sum(attn_error_list) / len(attn_error_list)
+        print(f"Attn Average Relative Error: {avg_attn_error*100:.4f}%")
+    
+    if pratex_list and prate1_list and prate2_list and prate3_list:
+        avg_pratex = sum(pratex_list) / len(pratex_list)
         avg_prate1 = sum(prate1_list) / len(prate1_list)
         avg_prate2 = sum(prate2_list) / len(prate2_list)
         avg_prate3 = sum(prate3_list) / len(prate3_list)
-        print(f"Average Prune Rate 1: {avg_prate1*100:.2f}%")
-        print(f"Average Prune Rate 2: {avg_prate2*100:.2f}%")
-        print(f"Average Prune Rate Combined: {avg_prate3*100:.2f}%")
+        print(f"FFN Average Prune Rate X: {avg_pratex*100:.2f}%")
+        print(f"FFN Average Prune Rate 1: {avg_prate1*100:.2f}%")
+        print(f"FFN Average Prune Rate 2: {avg_prate2*100:.2f}%")
+        print(f"FFN Average Prune Rate Combined: {avg_prate3*100:.2f}%")
 
     if error_list:
         avg_error = sum(error_list) / len(error_list)
-        print(f"Average Relative Error: {avg_error*100:.4f}%")
+        print(f"FFN Average Relative Error: {avg_error*100:.4f}%")
 
         # Practically, avg. rel. error under 1% generates the same text.
-
 
 if __name__ == "__main__":
     main()
