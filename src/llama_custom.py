@@ -36,6 +36,19 @@ from functools import partial
 
 logger = logging.get_logger(__name__)
 
+PREPARA_ATTN  = True
+PREPARA_PALN  = True
+PREPARA_FFN   = True
+
+DMERGE_ATTN   = False
+DMERGE_PALN   = False
+DMERGE_FFN    = True
+
+THRES_ATTN    = 5e-4
+THRES_FFN_X   = 0
+THRES_FFN_1   = 8e-2
+THRES_FFN_2   = 1.5e-1
+
 def scaled_dot_product_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -93,7 +106,6 @@ def scaled_dot_product_attention(
     return output
 
 attn_prate_list = []
-attn_error_list = []
 def scaled_dot_product_attention_pp(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -175,8 +187,7 @@ def scaled_dot_product_attention_pp(
         attn_weights = F.dropout(attn_weights, p=dropout_p, training=True)
 
     # Generate pruning mask
-    threshold = 1e-2
-    prune_mask = attn_weights.abs() < threshold
+    prune_mask = attn_weights.abs() < THRES_ATTN
 
     # Output from quantized attention
     output = torch.matmul(attn_weights, value)
@@ -185,9 +196,6 @@ def scaled_dot_product_attention_pp(
     attn_weights = torch.where(prune_mask, torch.zeros_like(attn_weights), attn_weights)
     attn_prate_list.append(prune_mask.float().mean().item())
 
-    attn_error = attn_weights_exp / (attn_weights_sum + 1e-9) - attn_weights
-    attn_error_list.append(attn_error.abs().mean().item() / (attn_weights_exp / (attn_weights_sum + 1e-9)).abs().mean().item())
-
     term1_scores_diff = (q_diff @ key.transpose(-2, -1) + query @ k_diff.transpose(-2, -1)) * scale_factor
     sum_dS_P = torch.sum(term1_scores_diff * attn_weights, dim=-1, keepdim=True)
     dP = attn_weights * (term1_scores_diff - sum_dS_P)
@@ -195,12 +203,9 @@ def scaled_dot_product_attention_pp(
 
     term2 = torch.matmul(attn_weights, v_diff)
 
-    output += term1
-    output += term2
+    return output, term1+term2
 
-    return output
-
-def sdpa_attention_forward(
+def sdpa_attention_forward_pp(
     module: torch.nn.Module,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -238,7 +243,7 @@ def sdpa_attention_forward(
             attention_mask = torch.logical_not(attention_mask.bool()).to(query.device)
 
     # attn_output = scaled_dot_product_attention(
-    attn_output = scaled_dot_product_attention_pp(
+    attn_output, dy = scaled_dot_product_attention_pp(
         query,
         key,
         value,
@@ -250,7 +255,7 @@ def sdpa_attention_forward(
     )
     attn_output = attn_output.transpose(1, 2).contiguous()
 
-    return attn_output, None
+    return (attn_output, dy), None
 
 def llama_decoder_selfattn_forward(
     dec_attn,
@@ -278,7 +283,7 @@ def llama_decoder_selfattn_forward(
 
     attention_interface: Callable = eager_attention_forward
     if dec_attn.config._attn_implementation == "sdpa":
-        attention_interface = sdpa_attention_forward
+        attention_interface = sdpa_attention_forward_pp
     elif dec_attn.config._attn_implementation != "eager":
         attention_interface = ALL_ATTENTION_FUNCTIONS[dec_attn.config._attn_implementation]
 
@@ -293,9 +298,42 @@ def llama_decoder_selfattn_forward(
         **kwargs,
     )
 
+    if dec_attn.config._attn_implementation == "sdpa":
+        attn_output, dy = attn_output
+    else:
+        dy = torch.zeros_like(attn_output)
+
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = dec_attn.o_proj(attn_output)
-    return attn_output, attn_weights
+
+    attn_dy = dy.reshape(*input_shape, -1).contiguous()
+    attn_dy = dec_attn.o_proj(attn_dy)
+
+    return (attn_output, attn_dy), attn_weights
+
+def llama_decoder_paln_forward_pp(decoder_layer, hidden_states, d_hidden=None):
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    s_inv = torch.rsqrt(variance + decoder_layer.post_attention_layernorm.variance_epsilon)
+    normalized_states = hidden_states * s_inv
+    output = decoder_layer.post_attention_layernorm.weight * normalized_states.to(input_dtype)
+
+    if d_hidden is not None:
+        # print(f"d_hidden/hidden_states: {d_hidden.norm()/hidden_states.norm():.4%}")
+        d_hidden_f32 = d_hidden.to(torch.float32)
+        weight_f32 = decoder_layer.post_attention_layernorm.weight.to(torch.float32)
+        
+        D = normalized_states.shape[-1]
+        term2_scalar = (d_hidden_f32 * normalized_states).sum(dim=-1, keepdim=True)
+        term2_vector = normalized_states * term2_scalar / D
+        
+        d_output = s_inv * (d_hidden_f32 - term2_vector) * weight_f32
+
+        d_output = d_output.to(input_dtype)
+
+    return output, d_output
 
 def llama_decoder_ffn_forward(dec_ffn, x):
     gate_proj = dec_ffn.gate_proj(x)
@@ -310,8 +348,7 @@ pratex_list = []
 prate1_list = []
 prate2_list = []
 prate3_list = []
-error_list = []
-def llama_decoder_ffn_forward_pp(dec_ffn, x):
+def llama_decoder_ffn_forward_pp(dec_ffn, x, d_hidden=None):
     # Quantize input to int8
     abs_max = x.abs().max()
     x_norm = x / abs_max * 127
@@ -320,9 +357,10 @@ def llama_decoder_ffn_forward_pp(dec_ffn, x):
 
     # Calculate quantization error
     diff_x = x - x_quant
+    if d_hidden is not None:
+        diff_x = diff_x + d_hidden
 
-    thres_x = 1e-3
-    prune_mask_x = diff_x.abs() < thres_x
+    prune_mask_x = diff_x.abs() < THRES_FFN_X
     diff_x = torch.where(prune_mask_x, torch.zeros_like(diff_x), diff_x)
     pratex_list.append(prune_mask_x.float().mean().item())
 
@@ -346,12 +384,10 @@ def llama_decoder_ffn_forward_pp(dec_ffn, x):
     silu_derivative = sigmoid_gate_proj * (1 + gate_proj * (1 - sigmoid_gate_proj))
     
     # Mask to Prune
-    threshold_1 = 1e-1
-    prune_mask_1 = (silu_derivative * up_proj).abs() < threshold_1
+    prune_mask_1 = (silu_derivative * up_proj).abs() < THRES_FFN_1
     prate1_list.append(prune_mask_1.float().mean().item())
 
-    threshold_2 = 2e-1
-    prune_mask_2 = activated.abs() < threshold_2
+    prune_mask_2 = activated.abs() < THRES_FFN_2
     prate2_list.append(prune_mask_2.float().mean().item())
 
     # 3. Apply the product rule for the gating step: d(a*b) = da*b + a*db
@@ -371,16 +407,11 @@ def llama_decoder_ffn_forward_pp(dec_ffn, x):
     # 4. Apply the final down projection
     diff_y = dec_ffn.down_proj(diff_multiplied)
 
-    # Add the correction term to the main path result
-    output = down_proj + diff_y
+    return down_proj, diff_y
 
-    # Calculate error term for analysis
-    output_original = dec_ffn(x)
-    error = output_original - output
-    error_list.append(error.abs().mean().item() / output_original.abs().mean().item())
-
-    return output
-
+attn_correction_list = []
+lnorm_correction_list = []
+ffn_correction_list = []
 def llama_decoder_forward(
     decoder_layer,
     hidden_states: torch.Tensor,
@@ -396,24 +427,71 @@ def llama_decoder_forward(
     hidden_states = decoder_layer.input_layernorm(hidden_states)
     
     # Self Attention
-    hidden_states, _ = llama_decoder_selfattn_forward(
-        decoder_layer.self_attn,
-        hidden_states=hidden_states,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=past_key_values,
-        use_cache=use_cache,
-        cache_position=cache_position,
-        position_embeddings=position_embeddings,
-        **kwargs,
-    )
+    if not PREPARA_ATTN:
+        hidden_states, _ = decoder_layer.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+    else:
+        (hidden_states, d_hidden), _ = llama_decoder_selfattn_forward(
+            decoder_layer.self_attn,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        correction = d_hidden.norm().item() / hidden_states.norm().item()
+        attn_correction_list.append(correction)
+
+        if DMERGE_ATTN:
+            hidden_states = hidden_states + d_hidden
+
     hidden_states = residual + hidden_states
 
     # Fully Connected
-    residual = hidden_states
-    hidden_states = decoder_layer.post_attention_layernorm(hidden_states)
-    # hidden_states = llama_decoder_ffn_forward(decoder_layer.mlp, hidden_states)
-    hidden_states = llama_decoder_ffn_forward_pp(decoder_layer.mlp, hidden_states)
+    if not DMERGE_ATTN:
+        residual = hidden_states + d_hidden
+    else:
+        residual = hidden_states
+        d_hidden = None
+
+    if not PREPARA_PALN:
+        hidden_states = decoder_layer.post_attention_layernorm(hidden_states)
+    else:
+        # regular_hidden = decoder_layer.post_attention_layernorm(hidden_states + d_hidden)
+        (hidden_states, d_hidden) = llama_decoder_paln_forward_pp(decoder_layer, hidden_states, d_hidden)
+        
+        correction = d_hidden.norm().item() / hidden_states.norm().item()
+        lnorm_correction_list.append(correction)
+
+        if DMERGE_PALN:
+            hidden_states = hidden_states + d_hidden
+            d_hidden = None
+
+    if not PREPARA_FFN:
+        hidden_states = llama_decoder_ffn_forward(decoder_layer.mlp, hidden_states)
+    else:
+        hidden_states, d_hidden = llama_decoder_ffn_forward_pp(decoder_layer.mlp, hidden_states, d_hidden)
+        correction = d_hidden.norm().item() / hidden_states.norm().item()
+        ffn_correction_list.append(correction)
+
+        if DMERGE_FFN:
+            hidden_states = hidden_states + d_hidden
+            d_hidden = None
+        else:
+            print("Warning: Not merging FFN correction!")
+            hidden_states = hidden_states + d_hidden
+    
     hidden_states = residual + hidden_states
     return hidden_states
 
@@ -1006,10 +1084,14 @@ def main():
         avg_attn_prate = sum(attn_prate_list) / len(attn_prate_list)
         print(f"Attn Average Prune Rate: {avg_attn_prate*100:.2f}%")
 
-    if attn_error_list:
-        avg_attn_error = sum(attn_error_list) / len(attn_error_list)
-        print(f"Attn Average Relative Error: {avg_attn_error*100:.4f}%")
+    if attn_correction_list:
+        avg_attn_correction = sum(attn_correction_list) / len(attn_correction_list)
+        print(f"Attn Average Correction Ratio: {avg_attn_correction*100:.4f}%")
     
+    if lnorm_correction_list:
+        avg_lnorm_correction = sum(lnorm_correction_list) / len(lnorm_correction_list)
+        print(f"LayerNorm Average Correction Ratio: {avg_lnorm_correction*100:.4f}%")
+
     if pratex_list and prate1_list and prate2_list and prate3_list:
         avg_pratex = sum(pratex_list) / len(pratex_list)
         avg_prate1 = sum(prate1_list) / len(prate1_list)
@@ -1020,11 +1102,9 @@ def main():
         print(f"FFN Average Prune Rate 2: {avg_prate2*100:.2f}%")
         print(f"FFN Average Prune Rate Combined: {avg_prate3*100:.2f}%")
 
-    if error_list:
-        avg_error = sum(error_list) / len(error_list)
-        print(f"FFN Average Relative Error: {avg_error*100:.4f}%")
-
-        # Practically, avg. rel. error under 1% generates the same text.
+    if ffn_correction_list:
+        avg_ffn_correction = sum(ffn_correction_list) / len(ffn_correction_list)
+        print(f"FFN Average Correction Ratio: {avg_ffn_correction*100:.4f}%")
 
 if __name__ == "__main__":
     main()
