@@ -40,14 +40,36 @@ PREPARA_ATTN  = True
 PREPARA_PALN  = True
 PREPARA_FFN   = True
 
-DMERGE_ATTN   = False
-DMERGE_PALN   = False
+DMERGE_ATTN   = True
+DMERGE_PALN   = True
 DMERGE_FFN    = True
 
-THRES_ATTN    = 5e-4
-THRES_FFN_X   = 0
-THRES_FFN_1   = 8e-2
-THRES_FFN_2   = 1.5e-1
+# THRES_ATTN    = 1e-2
+# THRES_FFN_X   = 1e-4
+# THRES_FFN_1   = 1e-1
+# THRES_FFN_2   = 2e-1
+THRES_ATTN    = 0e-0
+THRES_FFN_X   = 0e-0
+THRES_FFN_0   = 0e-0
+THRES_FFN_1   = 0e-0
+THRES_FFN_2   = 0e-0
+
+# PREPARA_ATTN  = True
+# PREPARA_PALN  = True
+# PREPARA_FFN   = True
+
+# DMERGE_ATTN   = False
+# DMERGE_PALN   = False
+# DMERGE_FFN    = True
+
+# THRES_ATTN    = 1e-2
+# THRES_FFN_X   = 1e-4
+# THRES_FFN_1   = 2e-1
+# THRES_FFN_2   = 2e-1
+# THRES_ATTN    = 1e+10
+# THRES_FFN_X   = 0
+# THRES_FFN_1   = 1e+10
+# THRES_FFN_2   = 1e+10
 
 def scaled_dot_product_attention(
     query: torch.Tensor,
@@ -315,25 +337,41 @@ def llama_decoder_paln_forward_pp(decoder_layer, hidden_states, d_hidden=None):
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.to(torch.float32)
 
+    # Main RMSNorm Path
     variance = hidden_states.pow(2).mean(-1, keepdim=True)
     s_inv = torch.rsqrt(variance + decoder_layer.post_attention_layernorm.variance_epsilon)
     normalized_states = hidden_states * s_inv
     output = decoder_layer.post_attention_layernorm.weight * normalized_states.to(input_dtype)
 
+    # Taylor Correction Path
     if d_hidden is not None:
-        # print(f"d_hidden/hidden_states: {d_hidden.norm()/hidden_states.norm():.4%}")
         d_hidden_f32 = d_hidden.to(torch.float32)
         weight_f32 = decoder_layer.post_attention_layernorm.weight.to(torch.float32)
         
-        D = normalized_states.shape[-1]
-        term2_scalar = (d_hidden_f32 * normalized_states).sum(dim=-1, keepdim=True)
-        term2_vector = normalized_states * term2_scalar / D
+        # --- 1st and 2nd Order Correction ---
         
-        d_output = s_inv * (d_hidden_f32 - term2_vector) * weight_f32
+        # 1. Calculate the key scalar 'c' used in both terms
+        D = normalized_states.shape[-1]
+        c = (d_hidden_f32 * normalized_states).sum(dim=-1, keepdim=True) / D
 
+        # 2. Calculate the 1st-order term
+        # dy1 = (gamma/s) * (dx - c*x_hat)
+        d_output_1st = s_inv * (d_hidden_f32 - c * normalized_states) * weight_f32
+
+        # 3. Calculate the 2nd-order term by reusing 'c'
+        # dy2 = -(gamma/s^2) * (c*dx + c^2*x_hat)
+        term_in_bracket = (c * d_hidden_f32) + ((c ** 2) * normalized_states)
+        d_output_2nd = -weight_f32 * (s_inv ** 2) * term_in_bracket
+
+        # 4. Total correction is the sum of both terms
+        d_output = d_output_1st + d_output_2nd
         d_output = d_output.to(input_dtype)
+        
+    else:
+        d_output = torch.zeros_like(output)
 
     return output, d_output
+
 
 def llama_decoder_ffn_forward(dec_ffn, x):
     gate_proj = dec_ffn.gate_proj(x)
@@ -345,9 +383,12 @@ def llama_decoder_ffn_forward(dec_ffn, x):
     return down_proj
 
 pratex_list = []
+prate0_list = []
 prate1_list = []
 prate2_list = []
-prate3_list = []
+prate_order1_list = []
+correction_order1_list = []
+correction_order2_list = []
 def llama_decoder_ffn_forward_pp(dec_ffn, x, d_hidden=None):
     # Quantize input to int8
     abs_max = x.abs().max()
@@ -376,35 +417,55 @@ def llama_decoder_ffn_forward_pp(dec_ffn, x, d_hidden=None):
 
     sigmoid_gate_proj = torch.sigmoid(gate_proj)
 
-    # 1. Pass error through gate and up projections (dx * Wg, dx * Wu)
+    # Pass error through gate and up projections (dx * Wg, dx * Wu)
     diff_gate_proj = dec_ffn.gate_proj(diff_x)
     diff_up_proj = dec_ffn.up_proj(diff_x)
 
-    # 2. Calculate the derivative of the SiLU activation
-    silu_derivative = sigmoid_gate_proj * (1 + gate_proj * (1 - sigmoid_gate_proj))
+    # Calculate the derivatives of the SiLU activation
+    silu_dorder1 = sigmoid_gate_proj * (1 + gate_proj * (1 - sigmoid_gate_proj))
+    silu_dorder2 = sigmoid_gate_proj * (1 - sigmoid_gate_proj) * (1 - gate_proj * (2 - gate_proj * (1 - sigmoid_gate_proj)))
     
     # Mask to Prune
-    prune_mask_1 = (silu_derivative * up_proj).abs() < THRES_FFN_1
+    prune_mask_0 = activated.abs() < THRES_FFN_0
+    prate0_list.append(prune_mask_0.float().mean().item())
+
+    prune_mask_1 = (silu_dorder1 * up_proj).abs() < THRES_FFN_1
     prate1_list.append(prune_mask_1.float().mean().item())
 
-    prune_mask_2 = activated.abs() < THRES_FFN_2
+    prune_mask_2 = (silu_dorder2 * up_proj).abs() < THRES_FFN_2
     prate2_list.append(prune_mask_2.float().mean().item())
 
-    # 3. Apply the product rule for the gating step: d(a*b) = da*b + a*db
-    term1 = silu_derivative * up_proj * diff_gate_proj
-    term2 = activated * diff_up_proj
-    # diff_multiplied = term1 + term2
+    # First-order correctionterm
+    term_A = silu_dorder1 * up_proj * diff_gate_proj
+    term_B = activated * diff_up_proj
 
-    term1 = torch.where(prune_mask_1, torch.zeros_like(term1), term1)
-    term2 = torch.where(prune_mask_2, torch.zeros_like(term2), term2)
+    term_A = torch.where(prune_mask_1, torch.zeros_like(term_A), term_A)
+    term_B = torch.where(prune_mask_0, torch.zeros_like(term_B), term_B)
 
-    diff_multiplied = term1 + term2
+    diff_order1 = term_A + term_B
+    correction_order1_list.append(diff_order1.norm().item() / multiplied.norm().item())
 
-    prune_mask_union = prune_mask_1 & prune_mask_2
-    diff_multiplied = torch.where(prune_mask_union, torch.zeros_like(diff_multiplied), diff_multiplied)
-    prate3_list.append(prune_mask_union.float().mean().item())
+    prune_mask_order1 = prune_mask_1 & prune_mask_0
+    diff_order1 = torch.where(prune_mask_order1, torch.zeros_like(diff_order1), diff_order1)
+    prate_order1_list.append(prune_mask_order1.float().mean().item())
 
-    # 4. Apply the final down projection
+    # Second-order correction term (optional)
+    term2_A = 0.5 * (diff_gate_proj ** 2) * up_proj * silu_dorder2
+    term2_B = diff_gate_proj * diff_up_proj * silu_dorder1
+
+    # Prune the second-order terms using the most relevant existing masks
+    # Both terms are related to the gate path derivatives, so prune_mask_1 is the most logical choice
+    term2_A = torch.where(prune_mask_2, torch.zeros_like(term2_A), term2_A)
+    term2_B = torch.where(prune_mask_1, torch.zeros_like(term2_B), term2_B)
+
+    diff_order2 = term2_A + term2_B
+    correction_order2_list.append(diff_order2.norm().item() / multiplied.norm().item())
+
+    # Add the pruned second-order correction to the first-order result
+    diff_multiplied = diff_order1 + diff_order2
+    # diff_multiplied = diff_order1
+
+    # Apply the final down projection
     diff_y = dec_ffn.down_proj(diff_multiplied)
 
     return down_proj, diff_y
@@ -412,6 +473,7 @@ def llama_decoder_ffn_forward_pp(dec_ffn, x, d_hidden=None):
 attn_correction_list = []
 lnorm_correction_list = []
 ffn_correction_list = []
+ffn_error_list = []
 def llama_decoder_forward(
     decoder_layer,
     hidden_states: torch.Tensor,
@@ -481,9 +543,12 @@ def llama_decoder_forward(
     if not PREPARA_FFN:
         hidden_states = llama_decoder_ffn_forward(decoder_layer.mlp, hidden_states)
     else:
+        hidden_states_orig = llama_decoder_ffn_forward(decoder_layer.mlp, hidden_states)
+
         hidden_states, d_hidden = llama_decoder_ffn_forward_pp(decoder_layer.mlp, hidden_states, d_hidden)
         correction = d_hidden.norm().item() / hidden_states.norm().item()
         ffn_correction_list.append(correction)
+        ffn_error_list.append((hidden_states+d_hidden-hidden_states_orig).norm().item()/hidden_states_orig.norm().item())
 
         if DMERGE_FFN:
             hidden_states = hidden_states + d_hidden
@@ -1012,7 +1077,9 @@ def llama_generate(
 @torch.no_grad()
 def main():
     """Main function to run the comparison."""
-    model_id = "meta-llama/Llama-3.2-1B"
+    # model_id = "meta-llama/Llama-3.2-1B"
+    model_id = "meta-llama/Llama-3.2-1B-Instruct"
+    # model_id = "meta-llama/Llama-3.2-3B-Instruct"
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = LlamaForCausalLM.from_pretrained(
         model_id,
@@ -1024,8 +1091,19 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # prompt = "Llama 3.2 is a new model from Meta AI that is"
-    prompt = "Training Factors: We used custom training libraries, Meta's custom built GPU cluster, "
+    prompt = "Llama 3.2 is a new model from Meta AI that is"
+    # prompt = "Training Factors: We used custom training libraries, Meta's custom built GPU cluster, "
+    # prompt = "The increasing size of large language models has posed challenges"
+    # prompt = "In this work, we introduce BitNet, a scalable and stable 1-bit Transformer architecture designed for large language models."
+    # prompt = "Specifically, we introduce BitLinear as a drop-in replacement of the nn.Linear layer in order to train 1-bit weights from scratch."
+    # prompt = "Question: What is the boiling point of water at sea level in Celsius?\nAnswer:"
+    # prompt = "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost?\nAnswer: The ball costs $"
+    # prompt = "Explain the difference between 'affect' and 'effect' in a single sentence.\nAnswer:"
+    # prompt = "Write a Python function that takes a list of numbers and returns the sum of all even numbers in the list.\n\n```python\n"
+    # prompt = "Summarize the following text into a single sentence:\nText: The sun is a star at the center of the Solar System. It is a nearly perfect sphere of hot plasma, heated to incandescence by nuclear fusion reactions in its core.\nSummary:"
+    # prompt = "Find the degree for the given field extension Q(sqrt(2), sqrt(3), sqrt(18)) over Q.\nChoices:\n(A) 0\n(B) 4\n(C) 2\n(D) 6\nAnswer:"
+    # prompt = "Find all zeros in the indicated finite field of the given polynomial with coefficients in that field. x^5 + 3x^3 + x^2 + 2x in Z_5.\nChoices:\n(A) 0\n(B) 1\n(C) 0,1\n(D) 0,4\nAnswer:"
+    
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     generation_config = GenerationConfig(
         max_new_tokens=1000,
@@ -1092,19 +1170,31 @@ def main():
         avg_lnorm_correction = sum(lnorm_correction_list) / len(lnorm_correction_list)
         print(f"LayerNorm Average Correction Ratio: {avg_lnorm_correction*100:.4f}%")
 
-    if pratex_list and prate1_list and prate2_list and prate3_list:
+    if pratex_list:
         avg_pratex = sum(pratex_list) / len(pratex_list)
+        print(f"FFN D_Input Prune Rate: {avg_pratex*100:.2f}%")
+    if prate0_list:
+        avg_prate0 = sum(prate0_list) / len(prate0_list)
+        print(f"FFN SiLU Average Prune Rate: {avg_prate0*100:.2f}%")
+    if prate1_list:
         avg_prate1 = sum(prate1_list) / len(prate1_list)
+        print(f"FFN SiLU' Average Prune Rate: {avg_prate1*100:.2f}%")
+    if prate2_list:
         avg_prate2 = sum(prate2_list) / len(prate2_list)
-        avg_prate3 = sum(prate3_list) / len(prate3_list)
-        print(f"FFN Average Prune Rate X: {avg_pratex*100:.2f}%")
-        print(f"FFN Average Prune Rate 1: {avg_prate1*100:.2f}%")
-        print(f"FFN Average Prune Rate 2: {avg_prate2*100:.2f}%")
-        print(f"FFN Average Prune Rate Combined: {avg_prate3*100:.2f}%")
+        print(f"FFN SiLU'' Average Prune Rate: {avg_prate2*100:.2f}%")
 
     if ffn_correction_list:
         avg_ffn_correction = sum(ffn_correction_list) / len(ffn_correction_list)
         print(f"FFN Average Correction Ratio: {avg_ffn_correction*100:.4f}%")
+    if correction_order1_list:
+        avg_correction_order1 = sum(correction_order1_list) / len(correction_order1_list)
+        print(f" > FFN Order 1 Average Correction Ratio: {avg_correction_order1*100:.4f}%")
+    if correction_order2_list:
+        avg_correction_order2 = sum(correction_order2_list) / len(correction_order2_list)
+        print(f" > FFN Order 2 Average Correction Ratio: {avg_correction_order2*100:.4f}%")
+    if ffn_error_list:
+        avg_ffn_error = sum(ffn_error_list) / len(ffn_error_list)
+        print(f"FFN Average Relative Error: {avg_ffn_error*100:.4f}%")
 
 if __name__ == "__main__":
     main()
