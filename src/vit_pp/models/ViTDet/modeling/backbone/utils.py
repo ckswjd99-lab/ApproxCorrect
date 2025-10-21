@@ -202,8 +202,7 @@ class AddDecomposedRelPos(ExtendedModule):
         rel_pos_h: torch.Tensor,
         rel_pos_w: torch.Tensor,
         q_size: Tuple[int, int],
-        k_size: Tuple[int, int],
-        dmap: torch.Tensor = None
+        k_size: Tuple[int, int]
     ) -> torch.Tensor:
         q_h, q_w = q_size
         k_h, k_w = k_size
@@ -217,37 +216,14 @@ class AddDecomposedRelPos(ExtendedModule):
         rel_h = self.einsum("bhwc,hkc->bhwk", q_4d, Rh)
         rel_w = self.einsum("bhwc,wkc->bhwk", q_4d, Rw)
 
-        if dmap is None:
-            attn_4d = attn.view(B, q_h * q_w, k_h, k_w)
-            rel_h = rel_h.contiguous().view(B, q_h * q_w, k_h)
-            rel_w = rel_w.contiguous().view(B, q_h * q_w, k_w)
+        attn_4d = attn.view(B, q_h * q_w, k_h, k_w)
+        rel_h = rel_h.contiguous().view(B, q_h * q_w, k_h)
+        rel_w = rel_w.contiguous().view(B, q_h * q_w, k_w)
 
-            attn_4d = self.add(attn_4d, rel_h.unsqueeze(-1), inplace=True)
-            attn_4d = self.add(attn_4d, rel_w.unsqueeze(-2), inplace=True)
+        attn_4d = self.add(attn_4d, rel_h.unsqueeze(-1), inplace=True)
+        attn_4d = self.add(attn_4d, rel_w.unsqueeze(-2), inplace=True)
 
-            attn = attn_4d.view(B, q_h * q_w, k_h * k_w)
-
-        else:
-            dmap_flat = dmap.view(-1)
-            dmap = dmap.reshape(q_h, q_w)
-
-            attn_4d = attn.view(B, q_h * q_w, k_h, k_w)
-            rel_h = rel_h.contiguous().view(B, q_h * q_w, k_h)
-            rel_w = rel_w.contiguous().view(B, q_h * q_w, k_w)
-
-            attn_4d_sel = attn_4d[:, dmap_flat == 1]
-            rel_h_sel = rel_h[:, dmap_flat == 1]
-            rel_w_sel = rel_w[:, dmap_flat == 1]
-
-            attn_4d_sel = self.add(attn_4d_sel, rel_h_sel.unsqueeze(-1), inplace=True)
-            attn_4d_sel = self.add(attn_4d_sel, rel_w_sel.unsqueeze(-2), inplace=True)
-
-            attn_4d_sel = attn_4d_sel.view(B, -1, k_h * k_w)
-
-            attn = torch.zeros(
-                B, q_h * q_w, k_h * k_w, device=attn.device, dtype=attn.dtype
-            )
-            attn[:, dmap_flat == 1, :] = attn_4d_sel
+        attn = attn_4d.view(B, q_h * q_w, k_h * k_w)
 
         return attn
 
