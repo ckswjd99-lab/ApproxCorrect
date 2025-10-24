@@ -76,6 +76,11 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         latency_attn = []
         latency_ffn = []
 
+        latency_norm = []
+        latency_gen_qkv = []
+        latency_self_attn = []
+        latency_proj = []
+
         new_cache_feature = {}
 
         # image_ndarray: (H, W, C)
@@ -105,7 +110,10 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             register_cache(f"bidx{bidx}_input", new_cache_feature, x)
 
             shortcut = x
+
+            ts_norm_start = time.time()
             x_attn = block.norm1(x)
+            latency_norm.append(time.time() - ts_norm_start)
 
             # Window partition
             ts_attn_start = time.time()
@@ -115,12 +123,17 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
 
             # Attention
             B_attn, H_attn, W_attn, _ = x_attn.shape
+
+            ts_gen_qkv_start = time.time()
             qkv = block.attn.qkv(x_attn).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)
             q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)
+            latency_gen_qkv.append(time.time() - ts_gen_qkv_start)
             
             register_cache(f"bidx{bidx}_attn_q", new_cache_feature, q)
             register_cache(f"bidx{bidx}_attn_k", new_cache_feature, k)
             register_cache(f"bidx{bidx}_attn_v", new_cache_feature, v)
+
+            ts_self_attn_start = time.time()
 
             attn_score = (q * block.attn.scale) @ k.transpose(-2, -1)
             register_cache(f"bidx{bidx}_attn_qkT", new_cache_feature, attn_score)
@@ -131,10 +144,14 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             attn_score = attn_score.softmax(dim=-1)
 
             x_attn = (attn_score @ v)
+            latency_self_attn.append(time.time() - ts_self_attn_start)
+
             register_cache(f"bidx{bidx}_attn_output", new_cache_feature, x_attn)
 
+            ts_proj_start = time.time()
             x_attn = x_attn.view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
             x_attn = block.attn.proj(x_attn)
+            latency_proj.append(time.time() - ts_proj_start)
             
             # Reverse window partition
             if block.window_size > 0:
@@ -162,12 +179,23 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             x = x_ffn
             latency_ffn.append(time.time() - ts_ffn_start)
         
+        if debug_time:
+            print(f"[DEBUG] Approximation Time Stats (ms):")
+            print(f"  Preprocess: {np.sum(latency_preproc)*1000:.2f}")
+            print(f"  Attention : {np.sum(latency_attn)*1000:.2f}")
+            print(f"   - Norm     : {np.sum(latency_norm)*1000:.2f}")
+            print(f"   - Gen QKV : {np.sum(latency_gen_qkv)*1000:.2f}")
+            print(f"   - Self Attn: {np.sum(latency_self_attn)*1000:.2f}")
+            print(f"   - Proj     : {np.sum(latency_proj)*1000:.2f}")
+            print(f"  FFN       : {np.sum(latency_ffn)*1000:.2f}")
+        
         return x, new_cache_feature
         
     def correct(
         self,
         diff_ndarray: np.ndarray | None,
-        cache_features: Dict[str, torch.Tensor]
+        cache_features: Dict[str, torch.Tensor],
+        prate_attn: float = 0.0,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         diff_tensor = torch.tensor(diff_ndarray, dtype=torch.float32).permute(2, 0, 1).to(self.device)
         diff = [
@@ -194,6 +222,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         # EncoderBlocks
         for bidx, block in enumerate(net.blocks):
             x_binput = cache_features[f"bidx{bidx}_input"]
+            register_cache(f"bidx{bidx}_input", cache_features, x_binput + dx)
             
             d_shortcut = dx
 
@@ -221,7 +250,12 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             dqkv = F.linear(dx_attn, block.attn.qkv.weight).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)
             dq, dk, dv = dqkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)
 
-            d_qkT = ((q + dq) * block.attn.scale) @ (k + dk).transpose(-2, -1) - qkT
+            register_cache(f"bidx{bidx}_attn_q", cache_features, q+dq)
+            register_cache(f"bidx{bidx}_attn_k", cache_features, k+dk)
+            register_cache(f"bidx{bidx}_attn_v", cache_features, v+dv)
+
+            # d_qkT = ((q + dq) * block.attn.scale) @ (k + dk).transpose(-2, -1) - qkT
+            d_qkT = (q @ dk.transpose(-2, -1) + dq @ k.transpose(-2, -1) + dq @ dk.transpose(-2, -1)) * block.attn.scale
             if block.attn.use_rel_pos:
                 d_qkT = block.attn.rel_pos_module(
                     d_qkT,
@@ -233,28 +267,28 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
                 )
             
             qkT_relpos = cache_features[f"bidx{bidx}_attn_qkT_relpos"]
-
-            d_softmax = (qkT_relpos + d_qkT).softmax(-1) - qkT_relpos.softmax(-1)
+            register_cache(f"bidx{bidx}_attn_qkT_relpos", cache_features, qkT_relpos + d_qkT)
 
             # > SPARSE D_SOFTMAX
             if block.window_size == 0:
-                prune_rate = 0.6
+                prune_rate = prate_attn
 
-                threshold_row = torch.quantile(qkT.sum(dim=-1), prune_rate, dim=-1)
-                alive_mask_row = (qkT.sum(dim=-1) >= threshold_row[:, None]).float()
+                threshold_row = torch.quantile(qkT_relpos.sum(dim=-1), prune_rate, dim=-1)
+                alive_mask_row = (qkT_relpos.sum(dim=-1) >= threshold_row[:, None]).float()
 
-                threshold_col = torch.quantile(qkT.sum(dim=-2), prune_rate, dim=-1)
-                alive_mask_col = (qkT.sum(dim=-2) >= threshold_col[:, None]).float()
+                threshold_col = torch.quantile(qkT_relpos.sum(dim=-2), prune_rate, dim=-1)
+                alive_mask_col = (qkT_relpos.sum(dim=-2) >= threshold_col[:, None]).float()
 
                 alive_mask = (alive_mask_row[:, :, None] * alive_mask_col[:, None, :])
-                d_softmax = d_softmax * alive_mask
+                d_qkT = d_qkT * alive_mask
                 
-                print(f"[DEBUG] Block {bidx} Attention d_softmax sparsity: {alive_mask.sum().item() / alive_mask.numel():%}")
+                # print(f"[DEBUG] Block {bidx} Attention d_softmax sparsity: {alive_mask.sum().item() / alive_mask.numel():%}")
 
+            d_softmax = (qkT_relpos + d_qkT).softmax(-1) - qkT_relpos.softmax(-1)
+            
             attn_output = cache_features[f"bidx{bidx}_attn_output"]
             d_attn_output = (qkT_relpos.softmax(-1) + d_softmax) @ (v + dv) - attn_output
-
-            # DEBUGGED: Correct till here
+            register_cache(f"bidx{bidx}_attn_output", cache_features, attn_output + d_attn_output)
 
             d_attn_output = d_attn_output.view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
             d_proj = F.linear(d_attn_output, block.attn.proj.weight)
@@ -269,11 +303,15 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             dx = d_shortcut + block.drop_path(dx)
 
             x = cache_features[f"bidx{bidx}_ffn_input"]
+            # Keep FFN input cache in sync for subsequent corrections
+            register_cache(f"bidx{bidx}_ffn_input", cache_features, x + dx)
 
-            dx_ffn = dx
             ffn_output = cache_features[f"bidx{bidx}_ffn_output"]
-            dx_ffn = dx_ffn + block.drop_path(block.mlp(block.norm2(x + dx)) - ffn_output)
-            dx = dx_ffn
+            delta_mlp = block.mlp(block.norm2(x + dx)) - ffn_output
+            # Update FFN output cache (pre-residual MLP output)
+            register_cache(f"bidx{bidx}_ffn_output", cache_features, ffn_output + delta_mlp)
+
+            dx = dx + block.drop_path(delta_mlp)
 
             if block.use_residual_block:
                 print(f"[WARN] Residual block is not supported in contexted inference.")
