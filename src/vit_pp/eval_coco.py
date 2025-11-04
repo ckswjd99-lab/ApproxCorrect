@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import cv2
 import argparse
+import time
 
 from models.ViTDet.maskedrcnn_vit_b_fpn import MaskedRCNN_ViT_B_FPN_Contexted
 from models.constants import COCO_LABELS_LIST, COCO_COLORS_ARRAY
@@ -38,11 +39,16 @@ def approx_and_correct(
         diff = (image_pyramid[l - 1] - image_pyramid[l]).astype(np.float32)
         diff_pyramid.append(diff)
     
-    x, cache_features = model.approx(image_pyramid[level])
+    ts_approx_start = time.time()
+    x, cache_features = model.approx(image_pyramid[level], prate_attn=prate_attn)
+    ts_approx_end = time.time()
+    
+    ts_correct_start = time.time()
     if not approx_only:
         for l in range(level, 0, -1):
             dx, cache_features = model.correct(diff_pyramid[l], cache_features, prate_attn=prate_attn)
             x = x + dx
+    ts_correct_end = time.time()
 
     (boxes, segments, labels, scores) = model.postprocess(x, cache_features)
 
@@ -56,6 +62,18 @@ def approx_and_correct(
             bounding_box=rel_box,
             confidence=float(score)
         ))
+
+    if False:
+        cache_size = sum(cache.numel() for cache in cache_features.values() if isinstance(cache, torch.Tensor)) * 4
+        print(f"Cache size: {cache_size/1e6:.4f} MB")
+
+        for cname, cvalue in cache_features.items():
+            if isinstance(cvalue, torch.Tensor):
+                print(f"{cname}: {cvalue.numel() * 4 / 1e6 :.4f} MB")
+
+        print(f"Latency")
+        print(f" > Approximate: {ts_approx_end - ts_approx_start}")
+        print(f" > Correct: {ts_correct_end - ts_correct_start}")
     
     return detections
     
@@ -107,8 +125,7 @@ def main():
         print(f"Level: {level} Baseline => mAP: {map_score}")
 
     # EVALUATE: ApproxCorrect
-    # for level in [1, 2]:
-    for level in [2]:
+    for level in [1, 2]:
         for prune_rate in [0.0, 0.5, 0.7, 0.9, 0.95, 1.0]:
             pred_field = f"predictions_level{level}_prate{int(prune_rate*100)}"
             with fo.ProgressBar(quiet=not VERBOSE) as pb:

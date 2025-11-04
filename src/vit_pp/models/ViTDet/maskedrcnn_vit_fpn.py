@@ -69,7 +69,12 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
 
         return boxes, segments, labels, scores
 
-    def approx(self, image_ndarray: np.ndarray, *args, **kwargs):
+    def approx(
+        self, 
+        image_ndarray: np.ndarray,
+        prate_attn: float,
+        *args, **kwargs
+    ):
         debug_time = kwargs.get("debug_time", False)
 
         latency_preproc = []
@@ -128,20 +133,31 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             qkv = block.attn.qkv(x_attn).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)
             q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)
             latency_gen_qkv.append(time.time() - ts_gen_qkv_start)
-            
-            register_cache(f"bidx{bidx}_attn_q", new_cache_feature, q)
-            register_cache(f"bidx{bidx}_attn_k", new_cache_feature, k)
-            register_cache(f"bidx{bidx}_attn_v", new_cache_feature, v)
 
             ts_self_attn_start = time.time()
 
             attn_score = (q * block.attn.scale) @ k.transpose(-2, -1)
-            register_cache(f"bidx{bidx}_attn_qkT", new_cache_feature, attn_score)
+
             if block.attn.use_rel_pos:
                 attn_score = block.attn.rel_pos_module(attn_score, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn))
-            register_cache(f"bidx{bidx}_attn_qkT_relpos", new_cache_feature, attn_score)
-            
             attn_score = attn_score.softmax(dim=-1)
+
+            if block.window_size == 0:
+                attn_score_pruned = attn_score.reshape(1, block.attn.num_heads, H_attn*W_attn, H_attn*W_attn)
+    
+                attn_sum_over_rows = attn_score_pruned.sum(dim=-2)
+
+                threshold_col = torch.quantile(attn_sum_over_rows, prate_attn, dim=-1)
+
+                alive_mask_col_flat = (attn_sum_over_rows >= threshold_col[:, :, None]).view(-1)
+                alive_indices_col = torch.nonzero(alive_mask_col_flat, as_tuple=False).squeeze(1)
+
+                attn_score_pruned_permuted_flat = attn_score_pruned.permute(0, 1, 3, 2).reshape(1, block.attn.num_heads * H_attn * W_attn, H_attn * W_attn)
+
+                attn_score_pruned_indexed = attn_score_pruned_permuted_flat[:, alive_indices_col]
+
+                register_cache(f"bidx{bidx}_attn_score_pruned", new_cache_feature, attn_score_pruned_indexed)
+                register_cache(f"bidx{bidx}_attn_score_alive_idx", new_cache_feature, alive_indices_col)
 
             x_attn = (attn_score @ v)
             latency_self_attn.append(time.time() - ts_self_attn_start)
@@ -226,7 +242,8 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             
             d_shortcut = dx
 
-            dx_norm = block.norm1(x_binput+dx) - block.norm1(x_binput)
+            x_norm_new = block.norm1(x_binput+dx)
+            dx_norm = x_norm_new - block.norm1(x_binput)
             
             dx = dx_norm
 
@@ -234,6 +251,7 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             if block.window_size > 0:
                 H, W = dx.shape[1], dx.shape[2]
                 dx, pad_hw = window_partition(dx, block.window_size)
+                x_norm_new, _ = window_partition(x_norm_new, block.window_size)
 
             # Attention
             # > qkv with shape (3, B, nHead, H * W, C)
@@ -242,52 +260,50 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
 
             B_attn, H_attn, W_attn, _ = dx_attn.shape
 
-            q = cache_features[f"bidx{bidx}_attn_q"]
-            k = cache_features[f"bidx{bidx}_attn_k"]
-            v = cache_features[f"bidx{bidx}_attn_v"]
-            qkT = cache_features[f"bidx{bidx}_attn_qkT"]
-
-            dqkv = F.linear(dx_attn, block.attn.qkv.weight).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)
-            dq, dk, dv = dqkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)
-
-            register_cache(f"bidx{bidx}_attn_q", cache_features, q+dq)
-            register_cache(f"bidx{bidx}_attn_k", cache_features, k+dk)
-            register_cache(f"bidx{bidx}_attn_v", cache_features, v+dv)
-
-            # d_qkT = ((q + dq) * block.attn.scale) @ (k + dk).transpose(-2, -1) - qkT
-            d_qkT = (q @ dk.transpose(-2, -1) + dq @ k.transpose(-2, -1) + dq @ dk.transpose(-2, -1)) * block.attn.scale
-            if block.attn.use_rel_pos:
-                d_qkT = block.attn.rel_pos_module(
-                    d_qkT,
-                    dq,
-                    block.attn.rel_pos_h,
-                    block.attn.rel_pos_w,
-                    (H_attn, W_attn),
-                    (H_attn, W_attn)
-                )
-            
-            qkT_relpos = cache_features[f"bidx{bidx}_attn_qkT_relpos"]
-            register_cache(f"bidx{bidx}_attn_qkT_relpos", cache_features, qkT_relpos + d_qkT)
-
             # > SPARSE D_SOFTMAX
-            if block.window_size == 0:
-                prune_rate = prate_attn
-
-                threshold_row = torch.quantile(qkT_relpos.sum(dim=-1), prune_rate, dim=-1)
-                alive_mask_row = (qkT_relpos.sum(dim=-1) >= threshold_row[:, None]).float()
-
-                threshold_col = torch.quantile(qkT_relpos.sum(dim=-2), prune_rate, dim=-1)
-                alive_mask_col = (qkT_relpos.sum(dim=-2) >= threshold_col[:, None]).float()
-
-                alive_mask = (alive_mask_row[:, :, None] * alive_mask_col[:, None, :])
-                d_qkT = d_qkT * alive_mask
-                
-                # print(f"[DEBUG] Block {bidx} Attention d_softmax sparsity: {alive_mask.sum().item() / alive_mask.numel():%}")
-
-            d_softmax = (qkT_relpos + d_qkT).softmax(-1) - qkT_relpos.softmax(-1)
-            
             attn_output = cache_features[f"bidx{bidx}_attn_output"]
-            d_attn_output = (qkT_relpos.softmax(-1) + d_softmax) @ (v + dv) - attn_output
+            
+            if block.window_size == 0:
+                # print(dx_attn.shape, block.attn.qkv.weight.shape)   # torch.Size([1, 64, 64, 768]) torch.Size([2304, 768])
+                dim_v = block.attn.qkv.weight.shape[0] // 3
+
+                dv = F.linear(
+                    dx_attn, block.attn.qkv.weight.reshape(3, dim_v, -1)[-1]
+                ).reshape(
+                    B_attn, H_attn * W_attn, 1, block.attn.num_heads, -1
+                ).permute(2, 0, 3, 1, 4)
+                dv = dv.reshape(B_attn * block.attn.num_heads, H_attn * W_attn, -1)
+
+                attn_score_pruned_indexed = cache_features[f"bidx{bidx}_attn_score_pruned"]
+                alive_indices_col = cache_features[f"bidx{bidx}_attn_score_alive_idx"]
+
+                num_alive_cols = alive_indices_col.shape[0]
+                attn_score_pruned_indexed = attn_score_pruned_indexed.reshape(
+                    1, 
+                    block.attn.num_heads, 
+                    num_alive_cols // block.attn.num_heads, 
+                    H_attn * W_attn
+                ).permute(0, 1, 3, 2)
+
+                dv_indexed = dv.reshape(-1, dv.shape[-1])[alive_indices_col].reshape(block.attn.num_heads, -1, dv.shape[-1])
+                
+                d_attn_output = attn_score_pruned_indexed @ dv_indexed
+            else:
+                qkv = block.attn.qkv(x_norm_new).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)
+                q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)
+
+                qkT_updated = (q @ k.transpose(-2, -1)) * block.attn.scale
+                if block.attn.use_rel_pos:
+                    qkT_updated = block.attn.rel_pos_module(
+                        qkT_updated,
+                        q,
+                        block.attn.rel_pos_h,
+                        block.attn.rel_pos_w,
+                        (H_attn, W_attn),
+                        (H_attn, W_attn)
+                    )
+                
+                d_attn_output = qkT_updated.softmax(-1) @ v - attn_output
             register_cache(f"bidx{bidx}_attn_output", cache_features, attn_output + d_attn_output)
 
             d_attn_output = d_attn_output.view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
