@@ -1,0 +1,316 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import cv2, numpy as np
+
+from detectron2.structures import Instances
+from detectron2.modeling.meta_arch import GeneralizedRCNN
+from detectron2.modeling.backbone.vit import Block, window_partition, window_unpartition, get_abs_pos
+
+from typing import List, Dict, Tuple
+
+from .counter.base import ExtendedModule
+from .counter.counting import CountedAdd, CountedMatmul, AddDecomposedRelPos
+from .utils import register_cache, cuda_timer
+from .subops import softmax_customed
+
+class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
+    def __init__(self, model, device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+):
+        super().__init__()
+
+        # Base model
+        self.model: GeneralizedRCNN = model.to(device)
+        self.device = device
+
+        # Counting module
+        self.add = CountedAdd()
+        self.matmul = CountedMatmul()
+        for block in self.model.backbone.net.blocks:
+            block.attn.rel_pos_module = AddDecomposedRelPos()
+
+        # AppCorr settings
+        self.approx_level = 1
+        self.prate_attn = 0
+
+        # Debug settings
+        self.debug_time = False
+        self.eta_approx = {
+            "total": 0.0,
+            "attention": 0.0,
+            "encoder": 0.0,
+        }
+        self.eta_correct = {
+            "total": 0.0,
+            "attention": 0.0,
+            "encoder": 0.0,
+        }
+    
+    def set_approx_level(self, level: int):
+        self.approx_level = level
+
+    def set_prate_attn(self, prate: float):
+        self.prate_attn = prate
+
+    def set_debug_time(self, debug: bool):
+        self.debug_time = debug
+    
+    # def reset_eta(self):
+    #     for key in self.eta_approx:
+    #         self.eta_approx[key] = 0.0
+    #     for key in self.eta_correct:
+    #         self.eta_correct[key] = 0.0
+
+    def forward(self, inputs: List[Dict[str, torch.Tensor]]) -> List[Dict[str, Instances]]:
+        '''
+        args:
+            inputs (list[dict]): each dict has keys "file_name", "height", "width", "image_id", "image"
+        returns:
+            list[dict]: each dict is the standard output format of Detectron2 GeneralizedRCNN
+        '''
+        if len(inputs) != 1:
+            raise NotImplementedError("Only batch size 1 is supported in AppCorr inference.")
+        
+        # Image pyramid
+        image_pyramid = []
+        image_original = inputs[0]["image"].cpu().numpy().transpose(1, 2, 0)  # HWC, numpy
+        for l in range(self.approx_level + 1):
+            downsampled = image_original
+            for _ in range(l):
+                downsampled = cv2.pyrDown(downsampled)
+            for _ in range(l):
+                downsampled = cv2.pyrUp(downsampled)
+            image_pyramid.append(torch.from_numpy(downsampled.transpose(2, 0, 1)).to(self.device))  # CHW, tensor
+
+        # Preprocess
+        image_pyramid = [
+            self.model.preprocess_image([{
+                "file_name": inputs[0]["file_name"], 
+                "height": inputs[0]["height"],
+                "width": inputs[0]["width"],
+                "image_id": inputs[0]["image_id"],
+                "image": image,
+            }]) for image in image_pyramid
+        ]
+
+        # Approximate inference with lowest resolution
+        images = image_pyramid[-1]
+
+        x, cache_features = self.approx_vit(images.tensor)
+
+        # Correct inference
+        for l in range(self.approx_level-1, -1, -1):
+            diff_l = image_pyramid[l].tensor - image_pyramid[l+1].tensor
+            x, cache_features = self.correct_vit(diff_l, cache_features)
+        
+        detections = self.postprocess(x, inputs, images)
+        
+        return detections
+
+    @cuda_timer(accumulator_attr="eta_approx['attention']")
+    def approx_attention(
+        self,
+        attn: nn.Module,
+        x: torch.Tensor,
+        cache_features: Dict[str, torch.Tensor],
+        prate_attn: float,
+        prefix: str
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+
+        B, H, W, _ = x.shape
+        
+        # qkv with shape (3, B, nHead, H * W, C)
+        qkv = attn.qkv(x).reshape(B, H * W, 3, attn.num_heads, -1).permute(2, 0, 3, 1, 4)
+        
+        # q, k, v with shape (B * nHead, H * W, C)
+        q, k, v = qkv.reshape(3, B * attn.num_heads, H * W, -1).unbind(0)
+
+        qkT = self.matmul((q * attn.scale), k.transpose(-2, -1))
+
+        if attn.use_rel_pos:
+            attn_score = attn.rel_pos_module(qkT, q, attn.rel_pos_h, attn.rel_pos_w, (H, W), (H, W))
+
+        attn_prob = attn_score.softmax(dim=-1)
+        register_cache(f"{prefix}_attn_prob", cache_features, attn_prob)
+        
+        x = self.matmul(attn_prob, v).view(B, attn.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+        register_cache(f"{prefix}_attn_out", cache_features, x)
+        
+        x = attn.proj(x)
+
+        return x, cache_features
+
+    @cuda_timer(accumulator_attr="eta_correct['attention']")
+    def correct_attention(
+        self,
+        attn: nn.Module,
+        x: torch.Tensor,
+        cache_features: Dict[str, torch.Tensor],
+        prate_attn: float,
+        prefix: str
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+
+        B, H, W, _ = x.shape
+        
+        v_dim = attn.qkv.out_features // 3
+        C = v_dim // attn.num_heads
+
+        v_weight = attn.qkv.weight[2*v_dim: , :]
+        v_bias = attn.qkv.bias[2*v_dim: ] if attn.qkv.bias is not None else None
+
+        v = F.linear(x, v_weight, v_bias)
+        v = v.reshape(B, H * W, attn.num_heads, C).transpose(1, 2).reshape(B * attn.num_heads, H * W, C)
+
+        attn_prob = cache_features[f"{prefix}_attn_prob"]
+        x = self.matmul(attn_prob, v).view(B, attn.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+        register_cache(f"{prefix}_attn_out", cache_features, x)
+
+        x = attn.proj(x)
+
+        return x, cache_features
+    
+    @cuda_timer(accumulator_attr="eta_approx['encoder']")
+    def approx_encoder(
+        self,
+        block: Block,
+        x: torch.Tensor,
+        cache_features: Dict[str, torch.Tensor],
+        prate_attn: float,
+        prefix: str
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+
+        shortcut = x
+        x = block.norm1(x)
+        
+        # Window partition
+        if block.window_size > 0:
+            H, W = x.shape[1], x.shape[2]
+            x, pad_hw = window_partition(x, block.window_size)
+
+        # Attention
+        x, cache_features = self.approx_attention(block.attn, x, cache_features, prate_attn, prefix)
+        
+        # Reverse window partition
+        if block.window_size > 0:
+            x = window_unpartition(x, block.window_size, pad_hw, (H, W))
+
+        # Add & Norm & MLP
+        x = self.add(shortcut, block.drop_path(x))
+        mlp_output = block.drop_path(block.mlp(block.norm2(x)))
+        x = self.add(x, mlp_output)
+
+        if block.use_residual_block:
+            x = block.residual(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+    
+        return x, cache_features
+
+    @cuda_timer(accumulator_attr="eta_correct['encoder']")
+    def correct_encoder(
+        self,
+        block: Block,
+        x_new: torch.Tensor,
+        cache_features: Dict[str, torch.Tensor],
+        prate_attn: float,
+        prefix: str
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        
+        shortcut = x_new
+        x_new = block.norm1(x_new)
+        
+        # Window partition
+        if block.window_size > 0:
+            H, W = x_new.shape[1], x_new.shape[2]
+            x_new, pad_hw = window_partition(x_new, block.window_size)
+
+        # Attention
+        x_new, cache_features = self.correct_attention(
+            block.attn, 
+            x_new, 
+            cache_features,
+            prate_attn,
+            prefix
+        )
+        
+        # Reverse window partition
+        if block.window_size > 0:
+            x_new = window_unpartition(x_new, block.window_size, pad_hw, (H, W))
+
+        # Add & Norm & MLP
+        x_new = self.add(shortcut, block.drop_path(x_new))
+        x_new = self.add(x_new, block.drop_path(block.mlp(block.norm2(x_new))))
+
+        if block.use_residual_block:
+            x_new = block.residual(x_new.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+    
+        return x_new, cache_features
+    
+    @cuda_timer(accumulator_attr="eta_approx['total']")
+    def approx_vit(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+
+        # Initilization
+        new_cache_features = {}
+        vit = self.model.backbone.net
+        
+        # Patch embedding
+        x = vit.patch_embed(x)
+        if vit.pos_embed is not None:
+            ape = get_abs_pos(
+                vit.pos_embed, vit.pretrain_use_cls_token, (x.shape[1], x.shape[2])
+            )
+            x = self.add(x, ape)
+
+        # Encoder blocks
+        register_cache(f"vit_input", new_cache_features, x)
+        for bidx, block in enumerate(vit.blocks):
+            x, new_cache_features = self.approx_encoder(block, x, new_cache_features, self.prate_attn, f"bidx{bidx}")
+
+        return x, new_cache_features
+    
+    @cuda_timer(accumulator_attr="eta_correct['total']")
+    def correct_vit(
+        self, dinput: torch.Tensor, cache_features: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+
+        vit = self.model.backbone.net
+
+        # Patch embedding
+        dx = F.conv2d(dinput, vit.patch_embed.proj.weight, None, stride=vit.patch_embed.proj.stride, padding=vit.patch_embed.proj.padding)
+        dx = dx.permute(0, 2, 3, 1)  # BCHW -> BHWC
+
+        # Encoder blocks
+        x = cache_features[f"vit_input"]
+        x = register_cache(f"vit_input", cache_features, x+dx)
+        for bidx, block in enumerate(vit.blocks):
+            x, cache_features = self.correct_encoder(block, x, cache_features, self.prate_attn, f"bidx{bidx}")
+
+        return x, cache_features
+
+    def postprocess(self, x: torch.Tensor, input, images):
+        backbone = self.model.backbone
+        net = backbone.net
+
+        bottom_up_features = {net._out_features[0]: x.permute(0, 3, 1, 2)}
+
+        features = bottom_up_features[backbone.in_feature]  # (1, 768, 64, 64)
+        results = []
+        for stage in backbone.stages:
+            results.append(stage(features))
+
+        if backbone.top_block is not None:
+            if backbone.top_block.in_feature in bottom_up_features:
+                top_block_in_feature = bottom_up_features[backbone.top_block.in_feature]
+            else:
+                top_block_in_feature = results[backbone._out_features.index(backbone.top_block.in_feature)]
+            results.extend(backbone.top_block(top_block_in_feature))
+        assert len(backbone._out_features) == len(results)
+        features = {f: res for f, res in zip(backbone._out_features, results)}
+        
+        # RPN
+        proposals, _ = self.model.proposal_generator(images, features, None)
+        results, _ = self.model.roi_heads(images, features, proposals, None)
+        detections = self.model._postprocess(results, input, images.image_sizes)
+
+        return detections
