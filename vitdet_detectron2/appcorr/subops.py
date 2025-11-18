@@ -21,4 +21,4 @@ def create_dmask(dinput: torch.Tensor, threshold=0.3) -> Tuple[torch.Tensor, tor
     dmask = (dinput > threshold).float()  # B, 1, H/16, W/16
     dindice = dmask.view(-1).nonzero(as_tuple=False)
 
-    return dmask, dindice
+    return dmask, dindice[:, 0]

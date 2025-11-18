@@ -6,6 +6,7 @@ from detectron2.engine.defaults import create_ddp_model
 from detectron2.evaluation import inference_on_dataset, print_csv_format
 
 import torch
+from rich import print
 
 from appcorr import MaskedRCNN_ViT_FPN_AppCorr
 
@@ -17,14 +18,16 @@ def do_test(cfg, model):
 
     # AppCorr settings
     APPROX_LEVEL = 1
-    PRATE_ATTN = 0.5
-    DMASK_THRES = 0.3
+    PRATE_ATTN = 0.0
+    PRATE_FFN = 0.0
+    DMASK_THRES = 0.7
     
     VERBOSE = False
     DEBUG_TIME = True
 
     func_inference.set_approx_level(APPROX_LEVEL)
     func_inference.set_prate_attn(PRATE_ATTN)
+    func_inference.set_prate_ffn(PRATE_FFN)
     func_inference.set_dmask_thres(DMASK_THRES)
     
     func_inference.set_verbose(VERBOSE)
@@ -39,16 +42,19 @@ def do_test(cfg, model):
     )
     print_csv_format(ret)
 
-    eta_approx, eta_correct, eta_etc = func_inference.avg_timecount()
-    print("Average Approx Time (ms):", eta_approx)
-    print("Average Correct Time (ms):", eta_correct)
-    print("Average Etc Time (ms):", eta_etc)
+    print("[bold yellow]=== Inference Summary ===[/bold yellow]")
+
+    eta_approx, eta_precorrect, eta_correct, eta_etc = func_inference.avg_timecount()
+    print("[bold yellow]Average Approx Time (ms):[/bold yellow]", eta_approx)
+    print("[bold yellow]Average Precorrect Time (ms):[/bold yellow]", eta_precorrect)
+    print("[bold yellow]Average Correct Time (ms):[/bold yellow]", eta_correct)
+    print("[bold yellow]Average Etc Time (ms):[/bold yellow]", eta_etc)
 
     avg_dindice_alive = func_inference.avg_dindice_alive()
-    print("Average Dinidce Alive Rate:", avg_dindice_alive)
+    print("[bold yellow]Average Dinidce Alive Rate:[/bold yellow]", avg_dindice_alive)
 
     last_cache_size = func_inference.last_cache_size
-    print(f"Last Cache Size: {last_cache_size / 1024 / 1024:.2f} MB")
+    print(f"[bold yellow]Last Cache Size:[/bold yellow] {last_cache_size / 1024 / 1024:.2f} MB")
 
     return ret
 

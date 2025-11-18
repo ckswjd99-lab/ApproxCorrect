@@ -33,26 +33,17 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         # AppCorr settings
         self.approx_level = 1
         self.prate_attn = 0
+        self.prate_ffn = 0
         self.dmask_thres = 0.3
 
         # Debug settings
         self.verbose = False
         self.debug_time = False
         self.num_inferences = 0
-        self.eta_approx = {
-            "vit": 0.0,
-            "attention": 0.0,
-            "encoder": 0.0,
-        }
-        self.eta_correct = {
-            "vit": 0.0,
-            "attention_global": 0.0,
-            "attention_windowed": 0.0,
-            "encoder": 0.0,
-        }
-        self.eta_etc = {
-            "postprocess": 0.0,
-        }
+        self.eta_approx = { }
+        self.eta_precorrect = { }
+        self.eta_correct = { }
+        self.eta_etc = { }
         self.dindice_alive = 0
         self.last_cache_size = 0
     
@@ -61,6 +52,9 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
 
     def set_prate_attn(self, prate: float):
         self.prate_attn = prate
+    
+    def set_prate_ffn(self, prate: float):
+        self.prate_ffn = prate
 
     def set_dmask_thres(self, thres: float):
         self.dmask_thres = thres
@@ -73,9 +67,10 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
     
     def avg_timecount(self):
         avg_approx = {key: val / max(1, self.num_inferences) for key, val in self.eta_approx.items()}
+        avg_precorrect = {key: val / max(1, self.num_inferences) for key, val in self.eta_precorrect.items()}
         avg_correct = {key: val / max(1, self.num_inferences) for key, val in self.eta_correct.items()}
         avg_etc = {key: val / max(1, self.num_inferences) for key, val in self.eta_etc.items()}
-        return avg_approx, avg_correct, avg_etc
+        return avg_approx, avg_precorrect, avg_correct, avg_etc
     
     def avg_dindice_alive(self):
         return self.dindice_alive / max(1, self.num_inferences)
@@ -122,7 +117,11 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         # Correct inference
         for l in range(self.approx_level-1, -1, -1):
             diff_l = image_pyramid[l].tensor - image_pyramid[l+1].tensor
-            x, cache_features = self.correct_vit(diff_l, cache_features)
+            dmask, dindice = create_dmask(diff_l, threshold=self.dmask_thres)
+            self.dindice_alive += dindice.size(0) / dmask.numel()
+            
+            cache_features = self.precorrect_vit(dindice, cache_features)
+            x, cache_features = self.correct_vit(diff_l, dindice, cache_features)
         
         detections = self.postprocess(x, inputs, images)
 
@@ -156,20 +155,28 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         # Encoder blocks
         register_cache(f"vit_input", new_cache_features, x)
         for bidx, block in enumerate(vit.blocks):
-            x, new_cache_features = self.approx_encoder(block, x, new_cache_features, self.prate_attn, f"bidx{bidx}")
+            x, new_cache_features = self.approx_encoder(block, x, new_cache_features, f"bidx{bidx}")
 
         return x, new_cache_features
     
-    @cuda_timer("eta_correct", "vit")
-    def correct_vit(
-        self, dinput: torch.Tensor, cache_features: Dict[str, torch.Tensor]
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    @cuda_timer("eta_precorrect", "vit")
+    def precorrect_vit(
+        self, dindice: torch.Tensor, cache_features: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
 
         vit = self.model.backbone.net
 
-        # create mask
-        dmask, dindice = create_dmask(dinput, threshold=self.dmask_thres)
-        self.dindice_alive += dindice.size(0) / dmask.numel()
+        for bidx, block in enumerate(vit.blocks):
+            cache_features = self.precorrect_encoder(block, cache_features, dindice, f"bidx{bidx}")
+
+        return cache_features
+
+    @cuda_timer("eta_correct", "vit")
+    def correct_vit(
+        self, dinput: torch.Tensor, dindice: torch.Tensor, cache_features: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+
+        vit = self.model.backbone.net
 
         # Patch embedding
         dx = F.conv2d(dinput, vit.patch_embed.proj.weight, None, stride=vit.patch_embed.proj.stride, padding=vit.patch_embed.proj.padding)
@@ -179,7 +186,7 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         x = cache_features[f"vit_input"]
         x = register_cache(f"vit_input", cache_features, x+dx)
         for bidx, block in enumerate(vit.blocks):
-            x, cache_features = self.correct_encoder(block, x, cache_features, self.prate_attn, dindice, f"bidx{bidx}")
+            x, cache_features = self.correct_encoder(block, x, cache_features, dindice, f"bidx{bidx}")
 
         return x, cache_features
 
@@ -189,7 +196,6 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         block: Block,
         x: torch.Tensor,
         cache_features: Dict[str, torch.Tensor],
-        prate_attn: float,
         prefix: str
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
@@ -202,7 +208,7 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
             x, pad_hw = window_partition(x, block.window_size)
 
         # Attention
-        x, cache_features = self.approx_attention(block.attn, x, cache_features, prate_attn, prefix)
+        x, cache_features = self.approx_attention(block.attn, x, cache_features, prefix)
         
         # Reverse window partition
         if block.window_size > 0:
@@ -216,13 +222,28 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
     
         return x, cache_features
 
+    @cuda_timer("eta_precorrect", "encoder")
+    def precorrect_encoder(
+        self,
+        block: Block,
+        cache_features: Dict[str, torch.Tensor],
+        dindice: torch.Tensor,
+        prefix: str
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+
+        if block.window_size == 0:
+            attn_prob = cache_features[f"{prefix}_attn_prob"]
+            attn_prob_sampled = attn_prob[:, dindice]
+            cache_features[f"{prefix}_attn_prob"] = attn_prob_sampled
+
+        return cache_features
+
     @cuda_timer("eta_correct", "encoder")
     def correct_encoder(
         self,
         block: Block,
         x_new: torch.Tensor,
         cache_features: Dict[str, torch.Tensor],
-        prate_attn: float,
         dindice: torch.Tensor,
         prefix: str
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -241,7 +262,6 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
             block.attn, 
             x_new, 
             cache_features,
-            prate_attn,
             dindice,
             prefix
         )
@@ -264,7 +284,6 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         attn: nn.Module,
         x: torch.Tensor,
         cache_features: Dict[str, torch.Tensor],
-        prate_attn: float,
         prefix: str
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
@@ -296,7 +315,6 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         attn: nn.Module,
         x: torch.Tensor,
         cache_features: Dict[str, torch.Tensor],
-        prate_attn: float,
         dindice: torch.Tensor,
         prefix: str
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -324,11 +342,10 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         attn: nn.Module,
         x: torch.Tensor,
         cache_features: Dict[str, torch.Tensor],
-        prate_attn: float,
         dindice: torch.Tensor,
         prefix: str
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        dindice = dindice[:, 0]  # flatten index
+        dindice = dindice  # flatten index
         num_alive = dindice.size(0)
 
         B, H, W, _ = x.shape
@@ -346,9 +363,7 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         # attn_out = self.matmul(attn_prob, v).view(B, attn.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
         # attn_proj = attn.proj(attn_out)
 
-        attn_prob = cache_features[f"{prefix}_attn_prob"]
-
-        attn_prob_sampled = attn_prob[:, dindice]  # TODO: do it during approximation for efficiency
+        attn_prob_sampled = cache_features[f"{prefix}_attn_prob"]
 
         attn_out_sampled = self.matmul(attn_prob_sampled, v)
         attn_out_sampled = attn_out_sampled.permute(1, 0, 2).reshape(B, num_alive, -1)
@@ -376,6 +391,12 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
 
         mlp_output = block.mlp.fc1(x)
         mlp_output = block.mlp.act(mlp_output)
+        
+        score_mlp_inter = mlp_output.reshape(-1, mlp_output.size(-1)).mean(dim=0)
+        indice_mlp_inter = torch.topk(score_mlp_inter, k=int((1 - self.prate_ffn) * mlp_output.size(-1)), largest=True).indices
+        register_cache(f"{prefix}_mlp_act", cache_features, mlp_output)
+        register_cache(f"{prefix}_mlp_act_indice", cache_features, indice_mlp_inter)
+
         mlp_output = block.mlp.fc2(mlp_output)
         register_cache(f"{prefix}_mlp_input", cache_features, x)
         register_cache(f"{prefix}_mlp_output", cache_features, mlp_output)
@@ -397,18 +418,30 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         prefix: str
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
+        mlp_input_old = cache_features[f"{prefix}_mlp_input"]
+        mlp_acti_old = cache_features[f"{prefix}_mlp_act"]
+        indice_mlp_act = cache_features[f"{prefix}_mlp_act_indice"]
+        mlp_output_old = cache_features[f"{prefix}_mlp_output"]
+
+        B, H, W, _ = x_new.shape
+
         shortcut = x_new
         mlp_input_new = block.norm2(x_new)
-        mlp_input_old = cache_features[f"{prefix}_mlp_input"]
 
         mlp_input_flat = mlp_input_new.view(-1, mlp_input_new.size(-1))
         mlp_input_sampled = F.embedding(dindice, mlp_input_flat)
+        # mlp_output_sampled = F.linear(mlp_input_sampled, block.mlp.fc1.weight[indice_mlp_act], block.mlp.fc1.bias[indice_mlp_act])
         mlp_output_sampled = F.linear(mlp_input_sampled, block.mlp.fc1.weight, block.mlp.fc1.bias)
-        mlp_output_sampled = block.mlp.act(mlp_output_sampled)
-        mlp_output_sampled = F.linear(mlp_output_sampled, block.mlp.fc2.weight, block.mlp.fc2.bias)
+        mlp_acti_sampled = block.mlp.act(mlp_output_sampled)
 
-        mlp_output_old = cache_features[f"{prefix}_mlp_output"]
-        mlp_output_old.view(-1, mlp_output_old.size(-1))[dindice] = mlp_output_sampled
+        # mlp_acti_old_sampled = mlp_acti_old.reshape(H*W, -1)[dindice][:, indice_mlp_act]
+        mlp_acti_old_sampled = F.embedding(dindice, mlp_acti_old.view(-1, mlp_acti_old.size(-1)))
+
+        d_acti_sampled = mlp_acti_sampled - mlp_acti_old_sampled
+        # d_output = F.linear(d_acti_sampled, block.mlp.fc2.weight[:, indice_mlp_act], None)
+        d_output = F.linear(d_acti_sampled, block.mlp.fc2.weight, None)
+
+        mlp_output_old.view(-1, mlp_output_old.size(-1))[dindice] += d_output
         mlp_output_new = mlp_output_old
 
         x_new = self.add(shortcut, block.drop_path(mlp_output_new))
