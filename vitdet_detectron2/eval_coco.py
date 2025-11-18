@@ -48,7 +48,7 @@ def do_test(cfg, model):
     print("Average Dinidce Alive Rate:", avg_dindice_alive)
 
     last_cache_size = func_inference.last_cache_size
-    print("Last Cache Size:", last_cache_size)
+    print(f"Last Cache Size: {last_cache_size / 1024 / 1024:.2f} MB")
 
     return ret
 

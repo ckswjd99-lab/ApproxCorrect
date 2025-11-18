@@ -183,6 +183,81 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
 
         return x, cache_features
 
+    @cuda_timer("eta_approx", "encoder")
+    def approx_encoder(
+        self,
+        block: Block,
+        x: torch.Tensor,
+        cache_features: Dict[str, torch.Tensor],
+        prate_attn: float,
+        prefix: str
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+
+        shortcut = x
+        x = block.norm1(x)
+        
+        # Window partition
+        if block.window_size > 0:
+            H, W = x.shape[1], x.shape[2]
+            x, pad_hw = window_partition(x, block.window_size)
+
+        # Attention
+        x, cache_features = self.approx_attention(block.attn, x, cache_features, prate_attn, prefix)
+        
+        # Reverse window partition
+        if block.window_size > 0:
+            x = window_unpartition(x, block.window_size, pad_hw, (H, W))
+
+        # Residual connection
+        x = self.add(shortcut, block.drop_path(x))
+        
+        # Norm & MLP
+        x, cache_features = self.approx_mlp(block, x, cache_features, prefix)
+    
+        return x, cache_features
+
+    @cuda_timer("eta_correct", "encoder")
+    def correct_encoder(
+        self,
+        block: Block,
+        x_new: torch.Tensor,
+        cache_features: Dict[str, torch.Tensor],
+        prate_attn: float,
+        dindice: torch.Tensor,
+        prefix: str
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        
+        shortcut = x_new
+        x_new = block.norm1(x_new)
+        
+        # Window partition
+        if block.window_size > 0:
+            H, W = x_new.shape[1], x_new.shape[2]
+            x_new, pad_hw = window_partition(x_new, block.window_size)
+
+        # Attention
+        attn_func = self.correct_attention_global if block.window_size == 0 else self.correct_attention_windowed
+        x_new, cache_features = attn_func(
+            block.attn, 
+            x_new, 
+            cache_features,
+            prate_attn,
+            dindice,
+            prefix
+        )
+        
+        # Reverse window partition
+        if block.window_size > 0:
+            x_new = window_unpartition(x_new, block.window_size, pad_hw, (H, W))
+
+        # Residual connection
+        x_new = self.add(shortcut, block.drop_path(x_new))
+        
+        # Norm & MLP
+        x_new, cache_features = self.correct_mlp(block, x_new, cache_features, dindice, prefix)
+    
+        return x_new, cache_features
+
     @cuda_timer("eta_approx", "attention")
     def approx_attention(
         self,
@@ -341,81 +416,6 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         if block.use_residual_block:
             x_new = block.residual(x_new.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
 
-        return x_new, cache_features
-
-    @cuda_timer("eta_approx", "encoder")
-    def approx_encoder(
-        self,
-        block: Block,
-        x: torch.Tensor,
-        cache_features: Dict[str, torch.Tensor],
-        prate_attn: float,
-        prefix: str
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-
-        shortcut = x
-        x = block.norm1(x)
-        
-        # Window partition
-        if block.window_size > 0:
-            H, W = x.shape[1], x.shape[2]
-            x, pad_hw = window_partition(x, block.window_size)
-
-        # Attention
-        x, cache_features = self.approx_attention(block.attn, x, cache_features, prate_attn, prefix)
-        
-        # Reverse window partition
-        if block.window_size > 0:
-            x = window_unpartition(x, block.window_size, pad_hw, (H, W))
-
-        # Residual connection
-        x = self.add(shortcut, block.drop_path(x))
-        
-        # Norm & MLP
-        x, cache_features = self.approx_mlp(block, x, cache_features, prefix)
-    
-        return x, cache_features
-
-    @cuda_timer("eta_correct", "encoder")
-    def correct_encoder(
-        self,
-        block: Block,
-        x_new: torch.Tensor,
-        cache_features: Dict[str, torch.Tensor],
-        prate_attn: float,
-        dindice: torch.Tensor,
-        prefix: str
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        
-        shortcut = x_new
-        x_new = block.norm1(x_new)
-        
-        # Window partition
-        if block.window_size > 0:
-            H, W = x_new.shape[1], x_new.shape[2]
-            x_new, pad_hw = window_partition(x_new, block.window_size)
-
-        # Attention
-        attn_func = self.correct_attention_global if block.window_size == 0 else self.correct_attention_windowed
-        x_new, cache_features = attn_func(
-            block.attn, 
-            x_new, 
-            cache_features,
-            prate_attn,
-            dindice,
-            prefix
-        )
-        
-        # Reverse window partition
-        if block.window_size > 0:
-            x_new = window_unpartition(x_new, block.window_size, pad_hw, (H, W))
-
-        # Residual connection
-        x_new = self.add(shortcut, block.drop_path(x_new))
-        
-        # Norm & MLP
-        x_new, cache_features = self.correct_mlp(block, x_new, cache_features, dindice, prefix)
-    
         return x_new, cache_features
 
     @cuda_timer("eta_etc", "postprocess")
