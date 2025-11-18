@@ -50,7 +50,11 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
             "attention_windowed": 0.0,
             "encoder": 0.0,
         }
+        self.eta_etc = {
+            "postprocess": 0.0,
+        }
         self.dindice_alive = 0
+        self.last_cache_size = 0
     
     def set_approx_level(self, level: int):
         self.approx_level = level
@@ -70,7 +74,8 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
     def avg_timecount(self):
         avg_approx = {key: val / max(1, self.num_inferences) for key, val in self.eta_approx.items()}
         avg_correct = {key: val / max(1, self.num_inferences) for key, val in self.eta_correct.items()}
-        return avg_approx, avg_correct
+        avg_etc = {key: val / max(1, self.num_inferences) for key, val in self.eta_etc.items()}
+        return avg_approx, avg_correct, avg_etc
     
     def avg_dindice_alive(self):
         return self.dindice_alive / max(1, self.num_inferences)
@@ -84,12 +89,6 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
             self.eta_correct[key] = 0.0
 
     def forward(self, inputs: List[Dict[str, torch.Tensor]]) -> List[Dict[str, Instances]]:
-        '''
-        args:
-            inputs (list[dict]): each dict has keys "file_name", "height", "width", "image_id", "image"
-        returns:
-            list[dict]: each dict is the standard output format of Detectron2 GeneralizedRCNN
-        '''
         if len(inputs) != 1:
             raise NotImplementedError("Only batch size 1 is supported in AppCorr inference.")
         
@@ -127,9 +126,62 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         
         detections = self.postprocess(x, inputs, images)
 
+        # Update time count
         self.num_inferences += 1
         
+        self.last_cache_size = 0
+        for fname, fvec in cache_features.items():
+            if isinstance(fvec, torch.Tensor):
+                self.last_cache_size += fvec.numel() * fvec.element_size()
+        
         return detections
+    
+    @cuda_timer("eta_approx", "vit")
+    def approx_vit(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+
+        # Initilization
+        new_cache_features = {}
+        vit = self.model.backbone.net
+        
+        # Patch embedding
+        x = vit.patch_embed(x)
+        if vit.pos_embed is not None:
+            ape = get_abs_pos(
+                vit.pos_embed, vit.pretrain_use_cls_token, (x.shape[1], x.shape[2])
+            )
+            x = self.add(x, ape)
+
+        # Encoder blocks
+        register_cache(f"vit_input", new_cache_features, x)
+        for bidx, block in enumerate(vit.blocks):
+            x, new_cache_features = self.approx_encoder(block, x, new_cache_features, self.prate_attn, f"bidx{bidx}")
+
+        return x, new_cache_features
+    
+    @cuda_timer("eta_correct", "vit")
+    def correct_vit(
+        self, dinput: torch.Tensor, cache_features: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+
+        vit = self.model.backbone.net
+
+        # create mask
+        dmask, dindice = create_dmask(dinput, threshold=self.dmask_thres)
+        self.dindice_alive += dindice.size(0) / dmask.numel()
+
+        # Patch embedding
+        dx = F.conv2d(dinput, vit.patch_embed.proj.weight, None, stride=vit.patch_embed.proj.stride, padding=vit.patch_embed.proj.padding)
+        dx = dx.permute(0, 2, 3, 1)  # BCHW -> BHWC
+
+        # Encoder blocks
+        x = cache_features[f"vit_input"]
+        x = register_cache(f"vit_input", cache_features, x+dx)
+        for bidx, block in enumerate(vit.blocks):
+            x, cache_features = self.correct_encoder(block, x, cache_features, self.prate_attn, dindice, f"bidx{bidx}")
+
+        return x, cache_features
 
     @cuda_timer("eta_approx", "attention")
     def approx_attention(
@@ -291,7 +343,6 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
 
         return x_new, cache_features
 
-
     @cuda_timer("eta_approx", "encoder")
     def approx_encoder(
         self,
@@ -366,54 +417,8 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         x_new, cache_features = self.correct_mlp(block, x_new, cache_features, dindice, prefix)
     
         return x_new, cache_features
-    
-    @cuda_timer("eta_approx", "vit")
-    def approx_vit(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
-        # Initilization
-        new_cache_features = {}
-        vit = self.model.backbone.net
-        
-        # Patch embedding
-        x = vit.patch_embed(x)
-        if vit.pos_embed is not None:
-            ape = get_abs_pos(
-                vit.pos_embed, vit.pretrain_use_cls_token, (x.shape[1], x.shape[2])
-            )
-            x = self.add(x, ape)
-
-        # Encoder blocks
-        register_cache(f"vit_input", new_cache_features, x)
-        for bidx, block in enumerate(vit.blocks):
-            x, new_cache_features = self.approx_encoder(block, x, new_cache_features, self.prate_attn, f"bidx{bidx}")
-
-        return x, new_cache_features
-    
-    @cuda_timer("eta_correct", "vit")
-    def correct_vit(
-        self, dinput: torch.Tensor, cache_features: Dict[str, torch.Tensor]
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-
-        vit = self.model.backbone.net
-
-        # create mask
-        dmask, dindice = create_dmask(dinput, threshold=self.dmask_thres)
-        self.dindice_alive += dindice.size(0) / dmask.numel()
-
-        # Patch embedding
-        dx = F.conv2d(dinput, vit.patch_embed.proj.weight, None, stride=vit.patch_embed.proj.stride, padding=vit.patch_embed.proj.padding)
-        dx = dx.permute(0, 2, 3, 1)  # BCHW -> BHWC
-
-        # Encoder blocks
-        x = cache_features[f"vit_input"]
-        x = register_cache(f"vit_input", cache_features, x+dx)
-        for bidx, block in enumerate(vit.blocks):
-            x, cache_features = self.correct_encoder(block, x, cache_features, self.prate_attn, dindice, f"bidx{bidx}")
-
-        return x, cache_features
-
+    @cuda_timer("eta_etc", "postprocess")
     def postprocess(self, x: torch.Tensor, input, images):
         backbone = self.model.backbone
         net = backbone.net

@@ -39,12 +39,16 @@ def do_test(cfg, model):
     )
     print_csv_format(ret)
 
-    eta_approx, eta_correct = func_inference.avg_timecount()
+    eta_approx, eta_correct, eta_etc = func_inference.avg_timecount()
     print("Average Approx Time (ms):", eta_approx)
     print("Average Correct Time (ms):", eta_correct)
+    print("Average Etc Time (ms):", eta_etc)
 
     avg_dindice_alive = func_inference.avg_dindice_alive()
     print("Average Dinidce Alive Rate:", avg_dindice_alive)
+
+    last_cache_size = func_inference.last_cache_size
+    print("Last Cache Size:", last_cache_size)
 
     return ret
 
