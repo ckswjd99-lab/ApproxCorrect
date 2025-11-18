@@ -17,20 +17,35 @@ def do_test(cfg, model):
 
     # AppCorr settings
     APPROX_LEVEL = 1
-    PRATE_ATTN = 0.0
-    DEBUG_TIME = False
+    PRATE_ATTN = 0.5
+    DMASK_THRES = 0.3
+    
+    VERBOSE = False
+    DEBUG_TIME = True
 
     func_inference.set_approx_level(APPROX_LEVEL)
     func_inference.set_prate_attn(PRATE_ATTN)
+    func_inference.set_dmask_thres(DMASK_THRES)
+    
+    func_inference.set_verbose(VERBOSE)
     func_inference.set_debug_time(DEBUG_TIME)
+
+    func_inference.reset_timecount()
 
     ret = inference_on_dataset(
         func_inference,
-        # model,
         instantiate(cfg.dataloader.test),
         instantiate(cfg.dataloader.evaluator),
     )
     print_csv_format(ret)
+
+    eta_approx, eta_correct = func_inference.avg_timecount()
+    print("Average Approx Time (ms):", eta_approx)
+    print("Average Correct Time (ms):", eta_correct)
+
+    avg_dindice_alive = func_inference.avg_dindice_alive()
+    print("Average Dinidce Alive Rate:", avg_dindice_alive)
+
     return ret
 
 @torch.no_grad()

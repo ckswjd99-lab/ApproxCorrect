@@ -25,7 +25,7 @@ def timer_end(start_event, end_event, description="Elapsed time"):
     # print(f"{description}: {elapsed_time} ms")
     return elapsed_time
 
-def cuda_timer(accumulator_attr=None):
+def cuda_timer(accumulator_name: str, tag: str):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs):
@@ -42,10 +42,15 @@ def cuda_timer(accumulator_attr=None):
 
             elapsed_time = start_event.elapsed_time(end_event)
 
-            if accumulator_attr:
-                current_total = getattr(self, accumulator_attr, 0)
-                setattr(self, accumulator_attr, current_total + elapsed_time)
-                print(f"[Timer] {func.__name__}: {elapsed_time} ms (Accumulated: {getattr(self, accumulator_attr)} ms)")
+            accumulator = getattr(self, accumulator_name, None)
+            if accumulator is None:
+                accumulator = {}
+                setattr(self, accumulator_name, accumulator)
+
+            current_total = accumulator.get(tag, 0.0)
+            accumulator[tag] = current_total + elapsed_time
+            if self.verbose:
+                print(f"[Timer] {func.__name__}: {elapsed_time} ms (Accumulated: {current_total} ms)")
 
             return result
         return wrapper
