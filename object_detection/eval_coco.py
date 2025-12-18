@@ -20,7 +20,7 @@ def do_test(cfg, model):
     APPROX_LEVEL = 1
     PRATE_ATTN = 0.0
     PRATE_FFN = 0.0
-    DMASK_THRES = 0.3
+    DMASK_THRES = -1.0
     
     VERBOSE = False
     DEBUG_TIME = True

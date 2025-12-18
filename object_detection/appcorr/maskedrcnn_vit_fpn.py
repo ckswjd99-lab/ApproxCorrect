@@ -6,7 +6,7 @@ import cv2, numpy as np
 
 from detectron2.structures import Instances
 from detectron2.modeling.meta_arch import GeneralizedRCNN
-from detectron2.modeling.backbone.vit import Block, window_partition, window_unpartition, get_abs_pos
+from detectron2.modeling.backbone.vit import Block, Attention, window_partition, window_unpartition, get_abs_pos
 
 from typing import List, Dict, Tuple
 
@@ -109,17 +109,20 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
             }]) for image in image_pyramid
         ]
 
+        diff_pyramid = []
+        for l in range(self.approx_level-1, -1, -1):
+            diff_l = image_pyramid[l].tensor - image_pyramid[l+1].tensor
+            dmask, dindice = create_dmask(diff_l, threshold=self.dmask_thres)
+            self.dindice_alive += dindice.size(0) / dmask.numel()
+            diff_pyramid.append((diff_l, dmask, dindice))
+
         # Approximate inference with lowest resolution
         images = image_pyramid[-1]
 
         x, cache_features = self.approx_vit(images.tensor)
 
-        # Correct inference
-        for l in range(self.approx_level-1, -1, -1):
-            diff_l = image_pyramid[l].tensor - image_pyramid[l+1].tensor
-            dmask, dindice = create_dmask(diff_l, threshold=self.dmask_thres)
-            self.dindice_alive += dindice.size(0) / dmask.numel()
-            
+        # Correct inference with higher resolutions
+        for diff_l, dmask, dindice in diff_pyramid:
             cache_features = self.precorrect_vit(dindice, cache_features)
             x, cache_features = self.correct_vit(diff_l, dindice, cache_features)
         
@@ -202,16 +205,15 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         shortcut = x
         x = block.norm1(x)
         
-        # Window partition
-        if block.window_size > 0:
+        # Attention
+        if block.window_size == 0:
+            x, cache_features = self.approx_attention_global(block.attn, x, cache_features, prefix)
+        else:
             H, W = x.shape[1], x.shape[2]
             x, pad_hw = window_partition(x, block.window_size)
 
-        # Attention
-        x, cache_features = self.approx_attention(block.attn, x, cache_features, prefix)
+            x, cache_features = self.approx_attention_windowed(block.attn, x, cache_features, prefix)
         
-        # Reverse window partition
-        if block.window_size > 0:
             x = window_unpartition(x, block.window_size, pad_hw, (H, W))
 
         # Residual connection
@@ -247,37 +249,24 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         dindice: torch.Tensor,
         prefix: str
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        bidx = int(prefix.replace("bidx", ""))
-
         
         shortcut = x_new
         x_new = block.norm1(x_new)
-        
-        # Window partition
-        if block.window_size > 0:
+
+        # Attention
+        bidx = int(prefix.replace("bidx", ""))
+        if block.window_size == 0:
+            x_new, cache_features = self.correct_attention_global(
+                block.attn, x_new, cache_features, dindice, prefix
+            )
+        else:
             H, W = x_new.shape[1], x_new.shape[2]
             x_new, pad_hw = window_partition(x_new, block.window_size)
 
-        # Attention
-        if block.window_size == 0:
-            x_new, cache_features = self.correct_attention_global(
-                block.attn, 
-                x_new, 
-                cache_features,
-                dindice,
-                prefix
-            )
-        else:
             x_new, cache_features = self.correct_attention_windowed(
-                block.attn, 
-                x_new, 
-                cache_features,
-                dindice,
-                prefix
+                block.attn, x_new, cache_features, dindice, prefix
             )
         
-        # Reverse window partition
-        if block.window_size > 0:
             x_new = window_unpartition(x_new, block.window_size, pad_hw, (H, W))
 
         # Residual connection
@@ -288,10 +277,10 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
     
         return x_new, cache_features
 
-    @cuda_timer("eta_approx", "attention")
-    def approx_attention(
+    @cuda_timer("eta_approx", "attention_global")
+    def approx_attention_global(
         self,
-        attn: nn.Module,
+        attn: Attention,
         x: torch.Tensor,
         cache_features: Dict[str, torch.Tensor],
         prefix: str
@@ -319,10 +308,78 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
 
         return x, cache_features
 
+    @cuda_timer("eta_approx", "attention_windowed")
+    def approx_attention_windowed(
+        self,
+        attn: Attention,
+        x: torch.Tensor,
+        cache_features: Dict[str, torch.Tensor],
+        prefix: str
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+
+        B, H, W, _ = x.shape
+        
+        # qkv with shape (3, B, nHead, H * W, C)
+        qkv = attn.qkv(x).reshape(B, H * W, 3, attn.num_heads, -1).permute(2, 0, 3, 1, 4)
+        
+        # q, k, v with shape (B * nHead, H * W, C)
+        q, k, v = qkv.reshape(3, B * attn.num_heads, H * W, -1).unbind(0)
+
+        qkT = self.matmul((q * attn.scale), k.transpose(-2, -1))
+
+        if attn.use_rel_pos:
+            attn_score = attn.rel_pos_module(qkT, q, attn.rel_pos_h, attn.rel_pos_w, (H, W), (H, W))
+
+        attn_prob = attn_score.softmax(dim=-1)
+        register_cache(f"{prefix}_attn_prob", cache_features, attn_prob)
+
+        x = self.matmul(attn_prob, v).view(B, attn.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)        
+        x = attn.proj(x)
+        register_cache(f"{prefix}_attn_proj", cache_features, x)
+
+        return x, cache_features
+    
+    @cuda_timer("eta_correct", "attention_global")
+    def correct_attention_global(
+        self,
+        attn: Attention,
+        x: torch.Tensor,
+        cache_features: Dict[str, torch.Tensor],
+        dindice: torch.Tensor,
+        prefix: str
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        dindice = dindice  # flatten index
+        num_alive = dindice.size(0)
+
+        B, H, W, _ = x.shape
+        
+        v_dim = attn.qkv.out_features // 3
+        C = v_dim // attn.num_heads
+
+        v_weight = attn.qkv.weight[2*v_dim: , :]
+        v_bias = attn.qkv.bias[2*v_dim: ] if attn.qkv.bias is not None else None
+
+        v = F.linear(x, v_weight, v_bias)
+        v = v.reshape(B, H * W, attn.num_heads, C).transpose(1, 2).reshape(B * attn.num_heads, H * W, C)
+
+        attn_prob_sampled = cache_features[f"{prefix}_attn_prob"]
+
+        attn_out_sampled = self.matmul(attn_prob_sampled, v)
+        attn_out_sampled = attn_out_sampled.permute(1, 0, 2).reshape(B, num_alive, -1)
+        attn_proj_sampled = attn.proj(attn_out_sampled)
+
+        attn_proj_old = cache_features[f"{prefix}_attn_proj"]
+        attn_proj_old = attn_proj_old.reshape(B, H * W, -1)
+        attn_proj_old[:, dindice] = attn_proj_sampled
+
+        attn_proj = attn_proj_old.reshape(B, H, W, -1)
+
+        return attn_proj, cache_features
+
     @cuda_timer("eta_correct", "attention_windowed")
     def correct_attention_windowed(
         self,
-        attn: nn.Module,
+        attn: Attention,
         x: torch.Tensor,
         cache_features: Dict[str, torch.Tensor],
         dindice: torch.Tensor,
@@ -346,47 +403,6 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
 
         return attn_proj, cache_features
     
-    @cuda_timer("eta_correct", "attention_global")
-    def correct_attention_global(
-        self,
-        attn: nn.Module,
-        x: torch.Tensor,
-        cache_features: Dict[str, torch.Tensor],
-        dindice: torch.Tensor,
-        prefix: str
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        dindice = dindice  # flatten index
-        num_alive = dindice.size(0)
-
-        B, H, W, _ = x.shape
-        
-        v_dim = attn.qkv.out_features // 3
-        C = v_dim // attn.num_heads
-
-        v_weight = attn.qkv.weight[2*v_dim: , :]
-        v_bias = attn.qkv.bias[2*v_dim: ] if attn.qkv.bias is not None else None
-
-        v = F.linear(x, v_weight, v_bias)
-        v = v.reshape(B, H * W, attn.num_heads, C).transpose(1, 2).reshape(B * attn.num_heads, H * W, C)
-
-        # attn_prob = cache_features[f"{prefix}_attn_prob"]
-        # attn_out = self.matmul(attn_prob, v).view(B, attn.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
-        # attn_proj = attn.proj(attn_out)
-
-        attn_prob_sampled = cache_features[f"{prefix}_attn_prob"]
-
-        attn_out_sampled = self.matmul(attn_prob_sampled, v)
-        attn_out_sampled = attn_out_sampled.permute(1, 0, 2).reshape(B, num_alive, -1)
-        attn_proj_sampled = attn.proj(attn_out_sampled)
-
-        attn_proj_old = cache_features[f"{prefix}_attn_proj"]
-        attn_proj_old = attn_proj_old.reshape(B, H * W, -1)
-        attn_proj_old[:, dindice] = attn_proj_sampled
-
-        attn_proj = attn_proj_old.reshape(B, H, W, -1)
-
-        return attn_proj, cache_features
-
     @cuda_timer("eta_approx", "ffn")
     def approx_mlp(
         self,
@@ -401,14 +417,7 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
 
         mlp_output = block.mlp.fc1(x)
         mlp_output = block.mlp.act(mlp_output)
-        
-        score_mlp_inter = mlp_output.reshape(-1, mlp_output.size(-1)).mean(dim=0)
-        indice_mlp_inter = torch.topk(score_mlp_inter, k=int((1 - self.prate_ffn) * mlp_output.size(-1)), largest=True).indices
-        register_cache(f"{prefix}_mlp_act", cache_features, mlp_output)
-        register_cache(f"{prefix}_mlp_act_indice", cache_features, indice_mlp_inter)
-
         mlp_output = block.mlp.fc2(mlp_output)
-        register_cache(f"{prefix}_mlp_input", cache_features, x)
         register_cache(f"{prefix}_mlp_output", cache_features, mlp_output)
 
         x = self.add(shortcut, block.drop_path(mlp_output))
@@ -428,9 +437,6 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         prefix: str
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
-        mlp_input_old = cache_features[f"{prefix}_mlp_input"]
-        mlp_acti_old = cache_features[f"{prefix}_mlp_act"]
-        indice_mlp_act = cache_features[f"{prefix}_mlp_act_indice"]
         mlp_output_old = cache_features[f"{prefix}_mlp_output"]
 
         B, H, W, _ = x_new.shape
@@ -439,27 +445,12 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         mlp_input_new = block.norm2(x_new)
 
         mlp_input_sampled = mlp_input_new.view(-1, mlp_input_new.size(-1))[dindice]
+        # mlp_input_sampled = F.embedding(dindice, mlp_input_new.view(-1, mlp_input_new.size(-1)))
         mlp_output_new = block.mlp.fc1(mlp_input_sampled)
         mlp_output_new = block.mlp.act(mlp_output_new)
         mlp_output_new = block.mlp.fc2(mlp_output_new)
         mlp_output_old.view(-1, mlp_output_old.size(-1))[dindice] = mlp_output_new
         mlp_output_new = mlp_output_old
-
-        # mlp_input_flat = mlp_input_new.view(-1, mlp_input_new.size(-1))
-        # mlp_input_sampled = F.embedding(dindice, mlp_input_flat)
-        # # mlp_output_sampled = F.linear(mlp_input_sampled, block.mlp.fc1.weight[indice_mlp_act], block.mlp.fc1.bias[indice_mlp_act])
-        # mlp_output_sampled = F.linear(mlp_input_sampled, block.mlp.fc1.weight, block.mlp.fc1.bias)
-        # mlp_acti_sampled = block.mlp.act(mlp_output_sampled)
-
-        # # mlp_acti_old_sampled = mlp_acti_old.reshape(H*W, -1)[dindice][:, indice_mlp_act]
-        # mlp_acti_old_sampled = F.embedding(dindice, mlp_acti_old.view(-1, mlp_acti_old.size(-1)))
-
-        # d_acti_sampled = mlp_acti_sampled - mlp_acti_old_sampled
-        # # d_output = F.linear(d_acti_sampled, block.mlp.fc2.weight[:, indice_mlp_act], None)
-        # d_output = F.linear(d_acti_sampled, block.mlp.fc2.weight, None)
-
-        # mlp_output_old.view(-1, mlp_output_old.size(-1))[dindice] += d_output
-        # mlp_output_new = mlp_output_old
 
         x_new = self.add(shortcut, block.drop_path(mlp_output_new))
 
