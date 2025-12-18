@@ -293,6 +293,7 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         
         # q, k, v with shape (B * nHead, H * W, C)
         q, k, v = qkv.reshape(3, B * attn.num_heads, H * W, -1).unbind(0)
+        register_cache(f"{prefix}_v", cache_features, v)
 
         qkT = self.matmul((q * attn.scale), k.transpose(-2, -1))
 
@@ -359,8 +360,13 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         v_weight = attn.qkv.weight[2*v_dim: , :]
         v_bias = attn.qkv.bias[2*v_dim: ] if attn.qkv.bias is not None else None
 
-        v = F.linear(x, v_weight, v_bias)
-        v = v.reshape(B, H * W, attn.num_heads, C).transpose(1, 2).reshape(B * attn.num_heads, H * W, C)
+        x_sampled = F.embedding(dindice, x.view(-1, x.size(-1)))
+        v_sampled = F.linear(x_sampled, v_weight, v_bias)
+        v_sampled = v_sampled.reshape(B, num_alive, attn.num_heads, C).transpose(1, 2).reshape(B * attn.num_heads, num_alive, C)
+
+        v_old = cache_features[f"{prefix}_v"]   # (B * nHead, H * W, C)
+        v_old[:, dindice] = v_sampled
+        v = v_old
 
         attn_prob_sampled = cache_features[f"{prefix}_attn_prob"]
 
@@ -444,8 +450,7 @@ class MaskedRCNN_ViT_FPN_AppCorr(ExtendedModule):
         shortcut = x_new
         mlp_input_new = block.norm2(x_new)
 
-        mlp_input_sampled = mlp_input_new.view(-1, mlp_input_new.size(-1))[dindice]
-        # mlp_input_sampled = F.embedding(dindice, mlp_input_new.view(-1, mlp_input_new.size(-1)))
+        mlp_input_sampled = F.embedding(dindice, mlp_input_new.view(-1, mlp_input_new.size(-1)))
         mlp_output_new = block.mlp.fc1(mlp_input_sampled)
         mlp_output_new = block.mlp.act(mlp_output_new)
         mlp_output_new = block.mlp.fc2(mlp_output_new)
